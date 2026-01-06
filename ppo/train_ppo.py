@@ -292,13 +292,6 @@ def main():
         eta_speed_scale_assumption=args.eta_speed_scale,
         eta_stop_service_steps=args.eta_service_steps,
     )
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        save_freq=args.save_freq,
-        log_dir=args.log_dir,
-        model_dir=args.model_dir,
-    )
 
 
 if __name__ == "__main__":
