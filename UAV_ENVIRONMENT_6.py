@@ -19,6 +19,9 @@ SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
 SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
 # Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
 
+# ===== Constants for READY-based deadline calculation =====
+FAR_FUTURE_DEADLINE_OFFSET = 10000  # Steps to add for orders not yet READY
+
 
 
 def set_global_seed(seed):
@@ -148,6 +151,12 @@ class StateManager:
         order = self.env.orders[order_id]
         old_status = order['status']
         order['status'] = new_status
+
+        # Track ready_step when order first transitions to READY
+        if new_status == OrderStatus.READY and 'ready_step' not in order:
+            order['ready_step'] = self.env.time_system.current_step
+            # Update deadline_step based on READY time
+            order['deadline_step'] = self.env._get_delivery_deadline_step(order)
 
         # 记录状态变更
         state_change = {
@@ -1015,6 +1024,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,# 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
+                 delivery_sla_steps: int = 60,  # SLA in steps from READY time
+                 timeout_factor: float = 2.0,  # Multiplier for deadline (deadline = ready_step + sla * timeout_factor)
                  ):
         super().__init__()
 
@@ -1040,6 +1051,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.reward_output_mode = str(reward_output_mode)
         self.enable_random_events = bool(enable_random_events)
         self.debug_state_warnings = bool(debug_state_warnings)  # Task B: debug flag
+        self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based SLA in steps
+        self.timeout_factor = float(timeout_factor)  # Multiplier for deadline
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
@@ -1306,6 +1319,30 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         prep_steps = int(order.get('preparation_time', 1))
         sla_steps = self._minutes_to_steps(15)
         return prep_steps + sla_steps
+
+    def _get_delivery_sla_steps(self, order: dict = None) -> int:
+        """
+        Get the delivery SLA in steps (READY-based).
+        Returns the constant delivery_sla_steps configured for the environment.
+        """
+        return self.delivery_sla_steps
+
+    def _get_delivery_deadline_step(self, order: dict) -> int:
+        """
+        Get the delivery deadline step for an order (READY-based).
+        
+        Returns: ready_step + delivery_sla_steps * timeout_factor
+        
+        If ready_step is not set (order not yet READY), returns a far future step.
+        """
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            # Order not yet READY, return a far future deadline
+            return self.time_system.current_step + FAR_FUTURE_DEADLINE_OFFSET
+        
+        sla_steps = self._get_delivery_sla_steps(order)
+        deadline = ready_step + int(sla_steps * self.timeout_factor)
+        return deadline
 
     # ------------------ Top-K merchants 观测选择 ------------------
 
@@ -2092,6 +2129,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _process_events(self):
         self._update_merchant_preparation()
+        self._cancel_timeout_orders()  # Cancel orders past READY-based deadline
         self._update_drone_positions()
         if self.enable_random_events:
             self._handle_random_events()
@@ -2625,8 +2663,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        promised_steps = self._get_promised_delivery_steps(order)
-        if delivery_duration <= promised_steps:
+        # Use READY-based deadline for on-time calculation
+        # Note: Orders should always have ready_step by the time they're delivered
+        # If missing, this is a data consistency issue - log warning
+        if 'ready_step' not in order:
+            print(f"WARNING: Order {order_id} delivered without ready_step - data consistency issue")
+        
+        deadline_step = self._get_delivery_deadline_step(order)
+        delivery_step = order['delivery_time']
+        
+        # Track on-time deliveries (READY-based: delivered before deadline)
+        if delivery_step <= deadline_step:
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
 
@@ -2662,6 +2709,35 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 base_loc = self.bases[drone['base']]['location']
                 self.state_manager.update_drone_status(drone_id, DroneStatus.RETURNING_TO_BASE,
                                                        target_location=base_loc)
+
+    def _cancel_timeout_orders(self):
+        """
+        Cancel orders that have exceeded their READY-based deadline.
+        Timeout is measured from ready_step, not creation_time.
+        """
+        current_step = self.time_system.current_step
+        timeout_orders = []
+        
+        for order_id in list(self.active_orders):
+            if order_id not in self.orders:
+                continue
+            
+            order = self.orders[order_id]
+            
+            # Only check READY or ASSIGNED orders for timeout
+            if order['status'] not in [OrderStatus.READY, OrderStatus.ASSIGNED]:
+                continue
+            
+            # Get READY-based deadline
+            deadline_step = self._get_delivery_deadline_step(order)
+            
+            # Check if order has exceeded deadline
+            if current_step > deadline_step:
+                timeout_orders.append(order_id)
+        
+        # Cancel all timeout orders
+        for order_id in timeout_orders:
+            self._cancel_order(order_id, "deadline_timeout_ready_based")
 
     # ------------------ drone helper states ------------------
 
@@ -3182,6 +3258,62 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _update_system_state(self):
         pass
 
+    def _get_ready_based_diagnostics(self):
+        """
+        Compute READY-based diagnostics for assignment slack and lateness.
+        
+        Returns dict with:
+        - assignment_slack_stats: stats about slack for READY orders
+        - delivered_lateness_stats: stats about lateness for delivered orders
+        """
+        current_step = self.time_system.current_step
+        
+        # Assignment slack: for READY orders, compute slack = deadline - current_step
+        ready_slacks = []
+        for order_id in self.active_orders:
+            if order_id not in self.orders:
+                continue
+            order = self.orders[order_id]
+            if order['status'] == OrderStatus.READY:
+                deadline = self._get_delivery_deadline_step(order)
+                slack = deadline - current_step
+                ready_slacks.append(slack)
+        
+        # Delivered lateness: for delivered orders, compute lateness = delivered_step - deadline
+        delivered_lateness = []
+        for order_id in self.completed_orders:
+            if order_id not in self.orders:
+                continue
+            order = self.orders[order_id]
+            if order['status'] == OrderStatus.DELIVERED and 'delivery_time' in order:
+                deadline = self._get_delivery_deadline_step(order)
+                delivery_step = order['delivery_time']
+                lateness = delivery_step - deadline
+                delivered_lateness.append(lateness)
+        
+        # Compute statistics
+        slack_stats = {
+            'count': len(ready_slacks),
+            'mean': float(np.mean(ready_slacks)) if ready_slacks else 0.0,
+            'min': float(np.min(ready_slacks)) if ready_slacks else 0.0,
+            'max': float(np.max(ready_slacks)) if ready_slacks else 0.0,
+            'std': float(np.std(ready_slacks)) if ready_slacks else 0.0,
+        }
+        
+        lateness_stats = {
+            'count': len(delivered_lateness),
+            'mean': float(np.mean(delivered_lateness)) if delivered_lateness else 0.0,
+            'min': float(np.min(delivered_lateness)) if delivered_lateness else 0.0,
+            'max': float(np.max(delivered_lateness)) if delivered_lateness else 0.0,
+            'std': float(np.std(delivered_lateness)) if delivered_lateness else 0.0,
+            'on_time_count': sum(1 for l in delivered_lateness if l <= 0),
+        }
+        
+        return {
+            'assignment_slack_stats': slack_stats,
+            'delivered_lateness_stats': lateness_stats,
+        }
+
     def _get_info(self):
         info = {
             'metrics': self.metrics.copy(),
@@ -3200,6 +3332,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'time_state': self.time_system.get_time_state(),
             'backlog_size': len(self.active_orders)
         }
+        
+        # Add READY-based diagnostics
+        ready_diagnostics = self._get_ready_based_diagnostics()
+        info['ready_based_diagnostics'] = ready_diagnostics
 
         if self.daily_stats['orders_completed'] > 0:
             info['avg_delivery_time'] = self.metrics['total_delivery_time'] / self.daily_stats['orders_completed']
@@ -3299,13 +3435,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
             
             # Create snapshot with essential fields
+            # Use READY-based deadline
+            # Note: ready_step should always exist for READY orders
+            if 'ready_step' not in order:
+                # This is a data consistency issue - skip this order or log warning
+                print(f"WARNING: READY order {oid} missing ready_step - skipping snapshot")
+                continue
+            
             snapshot = {
                 'order_id': oid,
                 'merchant_id': order['merchant_id'],
                 'merchant_location': order['merchant_location'],
                 'customer_location': order['customer_location'],
                 'creation_time': order['creation_time'],
-                'deadline_step': order.get('deadline_step', self.time_system.current_step + 100),
+                'ready_step': order['ready_step'],
+                'deadline_step': self._get_delivery_deadline_step(order),
                 'urgent': order.get('urgent', False),
                 'distance': order.get('distance', 0.0),
             }
