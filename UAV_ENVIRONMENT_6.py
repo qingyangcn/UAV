@@ -19,6 +19,9 @@ SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
 SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
 # Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
 
+# ===== Constants for READY-based deadline calculation =====
+FAR_FUTURE_DEADLINE_OFFSET = 10000  # Steps to add for orders not yet READY
+
 
 
 def set_global_seed(seed):
@@ -1335,7 +1338,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         ready_step = order.get('ready_step')
         if ready_step is None:
             # Order not yet READY, return a far future deadline
-            return self.time_system.current_step + 10000
+            return self.time_system.current_step + FAR_FUTURE_DEADLINE_OFFSET
         
         sla_steps = self._get_delivery_sla_steps(order)
         deadline = ready_step + int(sla_steps * self.timeout_factor)
@@ -2661,12 +2664,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.daily_stats['orders_completed'] += 1
 
         # Use READY-based deadline for on-time calculation
+        # Note: Orders should always have ready_step by the time they're delivered
+        # If missing, this is a data consistency issue - log warning
+        if 'ready_step' not in order:
+            print(f"WARNING: Order {order_id} delivered without ready_step - data consistency issue")
+        
         deadline_step = self._get_delivery_deadline_step(order)
         delivery_step = order['delivery_time']
-        
-        # Calculate READY-based lateness
-        ready_step = order.get('ready_step', order['creation_time'])
-        ready_based_lateness = delivery_step - deadline_step
         
         # Track on-time deliveries (READY-based: delivered before deadline)
         if delivery_step <= deadline_step:
@@ -3432,13 +3436,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             
             # Create snapshot with essential fields
             # Use READY-based deadline
+            # Note: ready_step should always exist for READY orders
+            if 'ready_step' not in order:
+                # This is a data consistency issue - skip this order or log warning
+                print(f"WARNING: READY order {oid} missing ready_step - skipping snapshot")
+                continue
+            
             snapshot = {
                 'order_id': oid,
                 'merchant_id': order['merchant_id'],
                 'merchant_location': order['merchant_location'],
                 'customer_location': order['customer_location'],
                 'creation_time': order['creation_time'],
-                'ready_step': order.get('ready_step', self.time_system.current_step),
+                'ready_step': order['ready_step'],
                 'deadline_step': self._get_delivery_deadline_step(order),
                 'urgent': order.get('urgent', False),
                 'distance': order.get('distance', 0.0),
