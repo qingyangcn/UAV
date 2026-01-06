@@ -3,6 +3,15 @@
 This repository implements a UAV delivery scheduling system with:
 - **MOPSO (Multi-Objective Particle Swarm Optimization)** for order assignment
 - **PPO (Proximal Policy Optimization)** for routing control (heading + speed)
+- **Diagnostics and Training Stabilizers** to achieve non-zero on-time deliveries
+
+## Quick Start
+
+Training with recommended stabilizers (solves 0% on-time delivery problem):
+```bash
+python ppo/train_ppo.py --total-steps 100000 -K 5 \
+  --throttle-warmup-steps 16 --eta-speed-scale 0.7
+```
 
 ## Features
 
@@ -16,13 +25,14 @@ This repository implements a UAV delivery scheduling system with:
 
 ### MOPSO Dispatcher
 - **algorithms/mopso_dispatcher.py**: Order assignment scheduler
-  - Parameters: M=200 (orders), K=10 (max per drone), P=30 (particles), I=10 (iterations)
+  - Parameters: M=200 (orders), K=5 (default, max per drone), P=30 (particles), I=10 (iterations)
   - Multi-objective fitness:
     - f0: Planned distance (minimize)
-    - f1: Expected timeout orders (minimize)
+    - f1: Expected timeout orders (minimize with conservative ETA)
     - f2: Planned energy consumption (minimize)
   - Pareto archive with crowding distance
   - Cross-merchant interleaved stop construction
+  - Conservative ETA mode to prevent over-commitment
 
 ### PPO Training
 - **ppo/train_ppo.py**: Training script using Stable-Baselines3
