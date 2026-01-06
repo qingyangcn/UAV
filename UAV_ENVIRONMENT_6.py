@@ -14,6 +14,12 @@ from sklearn.cluster import KMeans
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
+# ===== Constants for action processing =====
+SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
+SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
+# Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
+
+
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -2096,8 +2102,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     action_vec = headings[int(drone_id)]
                     ppo_hx, ppo_hy = action_vec[0], action_vec[1]
                     ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
-                    # Clip speed multiplier to [0.5, 1.5] for reasonable range
-                    ppo_u = np.clip((ppo_u + 1.0) / 2.0, 0.5, 1.5)
+                    # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
+                    ppo_u = np.clip((ppo_u + 1.0) / 2.0, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
 
                 ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
                 if ppo_norm > 1e-6:

@@ -153,8 +153,6 @@ def select_leader(archive: List[Tuple[np.ndarray, np.ndarray]],
         prob_sum = prob.sum()
         if prob_sum > 1e-10:
             prob = prob / prob_sum
-            # Ensure probabilities sum to exactly 1.0
-            prob = prob / prob.sum()
             
             # Sample based on diversity
             idx = rng.choice(len(archive), p=prob)

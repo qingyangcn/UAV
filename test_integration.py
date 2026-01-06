@@ -198,10 +198,11 @@ def test_action_processing():
     action = np.zeros((6, 3), dtype=np.float32)
     action[:, 0] = 0.5  # hx
     action[:, 1] = 0.5  # hy
-    action[:, 2] = 0.0  # u (will be mapped to speed multiplier)
+    action[:, 2] = 0.0  # u (speed multiplier in [-1, 1], mapped to [0.5, 1.5])
+    # Note: u=0.0 maps to speed multiplier 0.5 via formula: (u+1)/2 = (0+1)/2 = 0.5
     
     print(f"✓ Created action with shape {action.shape}")
-    print(f"  Sample action[0]: hx={action[0,0]}, hy={action[0,1]}, u={action[0,2]}")
+    print(f"  Sample action[0]: hx={action[0,0]}, hy={action[0,1]}, u={action[0,2]} (->speed 0.5x)")
     
     obs, reward, terminated, truncated, info = env.step(action)
     print(f"✓ Step with (N,3) action successful")

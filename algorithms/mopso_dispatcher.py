@@ -22,6 +22,9 @@ from algorithms.mopso_utils import (
     select_leader, select_best_solution
 )
 
+# Constants
+EPSILON = 1e-6  # Small value to prevent division by zero
+
 
 class MOPSOPlanner:
     """
@@ -172,7 +175,15 @@ class MOPSOPlanner:
                 if self.archive:
                     gbest_x = select_leader(self.archive, weights, self.rng)
                 else:
-                    gbest_x = p['pbest_x']
+                    # If no archive yet, use best pbest among all particles
+                    best_idx = 0
+                    best_score = -np.inf
+                    for i, particle in enumerate(particles):
+                        score = np.dot(weights, particle['pbest_f'])
+                        if score > best_score:
+                            best_score = score
+                            best_idx = i
+                    gbest_x = particles[best_idx]['pbest_x']
                 
                 # Update velocity
                 r1 = self.rng.rand(n_orders).astype(np.float32)
@@ -348,7 +359,7 @@ class MOPSOPlanner:
             total_distance += route_distance
             
             # Estimate timeout orders
-            estimated_time = route_distance / (drone['speed'] * speed_factor + 1e-6)
+            estimated_time = route_distance / (drone['speed'] * speed_factor + EPSILON)
             
             for order_id in order_ids:
                 order = order_map.get(order_id)
