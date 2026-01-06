@@ -144,19 +144,24 @@ def select_leader(archive: List[Tuple[np.ndarray, np.ndarray]],
     distances = crowding_distance(archive)
     
     # Select from top diverse solutions with some randomness
-    if np.any(np.isfinite(distances)):
-        # Normalize distances for probability
-        finite_mask = np.isfinite(distances)
-        prob = np.zeros_like(distances, dtype=np.float64)
-        prob[finite_mask] = distances[finite_mask]
+    # Replace infinite distances with a large finite value for normalization
+    has_finite = np.any(~np.isinf(distances))
+    if has_finite:
+        max_finite = np.max(distances[~np.isinf(distances)])
+        finite_distances = np.where(np.isinf(distances), max_finite * 2.0, distances)
+    else:
+        finite_distances = np.ones_like(distances)
+    
+    # Normalize for probability
+    prob = finite_distances.astype(np.float64)
+    prob_sum = prob.sum()
+    
+    if prob_sum > 1e-10 and not np.any(np.isnan(prob)):
+        prob = prob / prob_sum
         
-        prob_sum = prob.sum()
-        if prob_sum > 1e-10:
-            prob = prob / prob_sum
-            
-            # Sample based on diversity
-            idx = rng.choice(len(archive), p=prob)
-            return archive[idx][0].copy()
+        # Sample based on diversity
+        idx = rng.choice(len(archive), p=prob)
+        return archive[idx][0].copy()
     
     # Fallback to random selection
     idx = rng.randint(len(archive))

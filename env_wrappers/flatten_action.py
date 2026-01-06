@@ -46,9 +46,14 @@ class FlattenActionWrapper(gym.Wrapper):
         
         # Create flattened action space
         flat_size = self.n_drones * self.action_dim
+        
+        # Properly flatten bounds to maintain per-dimension constraints
+        low_flat = orig_space.low.flatten()
+        high_flat = orig_space.high.flatten()
+        
         self.action_space = spaces.Box(
-            low=orig_space.low.flatten()[0],  # Assume uniform bounds
-            high=orig_space.high.flatten()[0],
+            low=low_flat,
+            high=high_flat,
             shape=(flat_size,),
             dtype=orig_space.dtype
         )
