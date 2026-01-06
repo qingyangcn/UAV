@@ -1943,6 +1943,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             o['assigned_drone'] = drone_id
             drone['current_load'] += 1
             committed.append(oid)
+            
+            # Record READY-based assignment slack for diagnostics
+            deadline_step = self._get_delivery_deadline_step(o)
+            assignment_slack = deadline_step - self.time_system.current_step
+            if 'assignment_slack_samples' not in self.metrics:
+                self.metrics['assignment_slack_samples'] = []
+            self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         if not committed:
             return False
@@ -2043,6 +2050,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.state_manager.update_order_status(order_id, OrderStatus.ASSIGNED, reason=f"assigned_to_drone_{drone_id}")
         order['assigned_drone'] = drone_id
         drone['current_load'] += 1
+
+        # Record READY-based assignment slack for diagnostics
+        deadline_step = self._get_delivery_deadline_step(order)
+        assignment_slack = deadline_step - self.time_system.current_step
+        if 'assignment_slack_samples' not in self.metrics:
+            self.metrics['assignment_slack_samples'] = []
+        self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         target_merchant_loc = order['merchant_location']
 
@@ -2654,9 +2668,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        # Use READY-based deadline for on-time calculation
+        # Use READY-based deadline for on-time calculation and lateness tracking
         ready_step = order.get('ready_step', order['creation_time'])
         delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+        
+        # Record lateness for diagnostics
+        if 'ready_based_lateness_samples' not in self.metrics:
+            self.metrics['ready_based_lateness_samples'] = []
+        self.metrics['ready_based_lateness_samples'].append(delivery_lateness)
+        
         if delivery_lateness <= 0:
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
