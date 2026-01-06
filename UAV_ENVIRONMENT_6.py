@@ -151,7 +151,7 @@ class StateManager:
 
         # Record ready_step when transitioning to READY for the first time
         if new_status == OrderStatus.READY and old_status != OrderStatus.READY:
-            if 'ready_step' not in order or order.get('ready_step') is None:
+            if order.get('ready_step') is None:
                 order['ready_step'] = self.env.time_system.current_step
 
         # 记录状态变更
@@ -1326,11 +1326,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         Get READY-based delivery deadline step for an order.
         Uses ready_step as start time, falls back to creation_time if not available.
+        If neither is available (unlikely), uses current_step as last resort.
         """
         ready_step = order.get('ready_step')
         if ready_step is None:
             # Fallback: use creation_time if ready_step not set yet
-            ready_step = order.get('creation_time', self.time_system.current_step)
+            # (e.g., for orders not yet READY or old orders before this feature)
+            ready_step = order.get('creation_time')
+            if ready_step is None:
+                # Last resort: use current_step (should never happen in practice)
+                ready_step = self.time_system.current_step
         
         delivery_sla = self._get_delivery_sla_steps(order)
         deadline_step = ready_step + int(round(delivery_sla * self.timeout_factor))
@@ -2669,7 +2674,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.daily_stats['orders_completed'] += 1
 
         # Use READY-based deadline for on-time calculation and lateness tracking
-        ready_step = order.get('ready_step', order['creation_time'])
+        # Lateness = delivery_time - (ready_step + sla_steps)
+        # Use ready_step with creation_time as fallback if ready_step wasn't set
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+        
         delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
         
         # Record lateness for diagnostics
