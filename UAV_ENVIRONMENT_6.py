@@ -1997,7 +1997,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             commit_orders = []
             for st in planned_stops:
                 if st.get('type') == 'D' and 'order_id' in st:
-                    commit_orders.append(int(st['order_id']))
+                    try:
+                        oid = int(st['order_id'])
+                        commit_orders.append(oid)
+                    except (ValueError, TypeError):
+                        print(f"[apply_route_plan] REJECTED: Invalid order_id {st.get('order_id')}, must be integer")
+                        return False
             # unique, keep order
             commit_orders = list(dict.fromkeys(commit_orders))
 
@@ -2032,14 +2037,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         d_stop_orders = set()
         for st in planned_stops:
             if st.get('type') == 'D':
-                d_stop_orders.add(int(st['order_id']))
+                try:
+                    oid = int(st['order_id'])
+                    d_stop_orders.add(oid)
+                except (ValueError, TypeError, KeyError):
+                    print(f"[apply_route_plan] REJECTED: Invalid order_id in D stop")
+                    return False
         
         # Check each order appears at most once in D stops
         d_order_counts = {}
         for st in planned_stops:
             if st.get('type') == 'D':
-                oid = int(st['order_id'])
-                d_order_counts[oid] = d_order_counts.get(oid, 0) + 1
+                try:
+                    oid = int(st['order_id'])
+                    d_order_counts[oid] = d_order_counts.get(oid, 0) + 1
+                except (ValueError, TypeError, KeyError):
+                    # Already caught above, but be safe
+                    continue
         
         for oid, count in d_order_counts.items():
             if count > 1:
@@ -2061,8 +2075,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             for i, st in enumerate(planned_stops):
                 if st.get('type') == 'P' and st.get('merchant_id') == required_merchant:
                     p_positions.append(i)
-                elif st.get('type') == 'D' and st.get('order_id') == oid:
-                    d_position = i
+                elif st.get('type') == 'D':
+                    try:
+                        stop_oid = int(st.get('order_id'))
+                        if stop_oid == oid:
+                            d_position = i
+                    except (ValueError, TypeError):
+                        continue
             
             if d_position is None:
                 continue  # order in commit but no D stop is unusual but not invalid
@@ -2508,20 +2527,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if mid is None:
             return True  # Invalid stop, just skip
         
-        # Find all orders that should be picked up at this merchant
+        # Find all orders that should be picked up at this merchant for this drone
         expected_pickups = []
         for oid in list(self.active_orders):
             o = self.orders.get(oid)
             if o is None:
                 continue
+            # Only consider orders assigned to this specific drone
             if o.get('assigned_drone', -1) != drone_id:
                 continue
             if o.get('merchant_id', None) != mid:
                 continue
             expected_pickups.append((oid, o))
         
+        # If no orders expected at this merchant for this drone, that's OK
         if not expected_pickups:
-            # No orders to pick up at this merchant - this is OK
             return True
         
         # Try to pick up each expected order
@@ -2533,9 +2553,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 drone['cargo'].add(oid)
                 picked_count += 1
         
-        # Return success if we picked up at least one order
-        # (some orders might have been cancelled or changed status)
-        return picked_count > 0 if expected_pickups else True
+        # Return success if we picked up at least one order, or if there were no expected pickups
+        return picked_count > 0
 
     def _execute_delivery_stop(self, drone_id: int, drone: dict, stop: dict) -> bool:
         """
