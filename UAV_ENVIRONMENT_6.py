@@ -1669,6 +1669,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
                 # Route-aware fix: Only auto-pickup if NOT in route-plan mode
                 # In route-plan mode, orders are picked up explicitly at P stops
+                # Note: route_committed is set to True in apply_route_plan and cleared to False
+                # in _safe_reset_drone and when drone returns to base (RETURNING_TO_BASE arrival handler)
                 if not drone.get('route_committed', False):
                     # Legacy mode: auto-pickup when flying to customer
                     if order['status'] == OrderStatus.ASSIGNED:
@@ -1931,6 +1933,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         
         # If no stops remain after filtering, don't install route
         if not filtered_stops:
+            if self.debug_state_warnings:
+                print(f"[Warning] Drone {drone_id} route empty after filtering - no valid D stops")
             return False
 
         # 2) Install route plan with filtered stops
@@ -2104,7 +2108,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Silently check and count issues but don't spam output
             consistency_issues = self.state_manager.get_state_consistency_check()
             if consistency_issues and self.time_system.current_step % 64 == 0:
-                # Periodic summary: print count every 16 steps (1 hour)
+                # Periodic summary: print count every 64 steps (4 hours at 4 steps/hour)
                 print(f"[Step {self.time_system.current_step}] 状态一致性问题计数: {len(consistency_issues)}")
 
 
