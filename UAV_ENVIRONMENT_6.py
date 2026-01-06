@@ -1,3 +1,100 @@
+"""
+UAV Food Delivery Environment (Version 6)
+==========================================
+
+Multi-objective drone delivery optimization environment with route planning support.
+
+Key Features:
+-------------
+1. **Unified Route Planning Dispatch**
+   - External PSO scheduler uses `apply_route_plan()` to assign routes
+   - Supports interleaved multi-merchant pickup/delivery
+   - READY-only order dispatch (PSO only sees READY orders)
+   
+2. **Route Plan Validation**
+   - Validates stop structure (P/D types only)
+   - Enforces P-before-D ordering for each order
+   - Checks capacity constraints
+   - Validates order uniqueness and consistency
+   
+3. **Retry Mechanism**
+   - Failed pickup/delivery stops are retried (not discarded)
+   - Configurable retry policy: "front" or "back"
+   - Max retry threshold with degradation handling
+   
+4. **Timeout and Cancellation**
+   - Order timeout based on creation_time + promised_steps * timeout_factor
+   - Tracks cancellation reasons in metrics
+   - Prevents orders from hanging indefinitely
+   
+5. **PPO Heading Control**
+   - PPO outputs heading direction for drones
+   - Configurable alpha blending with target direction
+   - Fallback to target when PPO output is near zero
+   
+6. **Controllable Random Events**
+   - `enable_random_events` strictly controls random cancellations/address changes
+   - Deterministic mode for evaluation
+   - Seed-based reproducibility
+
+Configuration Parameters:
+-------------------------
+- `dispatch_mode`: "route_plan_only" (default) or "legacy"
+  - "route_plan_only": Only apply_route_plan() can assign orders
+  - "legacy": Allows internal auto-assignment (not recommended)
+  
+- `pickup_retry_policy`: "back" (default) or "front"
+  - Controls where failed stops are re-inserted in the queue
+  
+- `max_stop_retries`: Maximum retry attempts per stop (default: 3)
+- `timeout_factor`: Multiplier for order timeout deadline (default: 2.0)
+- `max_planned_stops`: Maximum stops in a route plan (default: 20)
+- `enable_random_events`: Enable/disable random events (default: True)
+
+Usage Example:
+--------------
+```python
+from UAV_ENVIRONMENT_6 import ThreeObjectiveDroneDeliveryEnv
+
+env = ThreeObjectiveDroneDeliveryEnv(
+    dispatch_mode="route_plan_only",
+    pickup_retry_policy="back",
+    max_stop_retries=3,
+    timeout_factor=2.0,
+    enable_random_events=False  # For evaluation
+)
+
+obs, info = env.reset(seed=42)
+
+# External PSO assigns route
+ready_orders = [oid for oid in env.active_orders 
+                if env.orders[oid]['status'] == OrderStatus.READY]
+route_plan = [
+    {'type': 'P', 'merchant_id': 'm1'},
+    {'type': 'D', 'order_id': ready_orders[0]},
+    # ... more stops
+]
+success = env.apply_route_plan(drone_id=0, planned_stops=route_plan)
+
+# PPO controls heading
+action = ppo_policy(obs)  # shape: (num_drones, 2)
+obs, reward, done, truncated, info = env.step(action)
+```
+
+Route Plan Format:
+------------------
+Each stop in `planned_stops` must be one of:
+- Pickup: `{'type': 'P', 'merchant_id': <merchant_id>}`
+- Delivery: `{'type': 'D', 'order_id': <order_id>}`
+
+Constraints:
+- All orders must be in READY status
+- P(merchant) must appear before D(order) for that order's merchant
+- Each order can appear at most once (one D stop)
+- Total stops must not exceed max_planned_stops
+- Committed orders must not exceed drone capacity
+"""
+
 import pandas as pd
 import numpy as np
 import gymnasium as gym
@@ -970,6 +1067,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  top_k_merchants: int = 100,
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,# 可选：评估时建议关掉随机事件
+                 # ===== 新增：调度模式与超时控制 =====
+                 dispatch_mode: str = "route_plan_only",  # "route_plan_only" or "legacy"
+                 pickup_retry_policy: str = "back",  # "front" or "back"
+                 max_stop_retries: int = 3,  # 最大重试次数
+                 timeout_factor: float = 2.0,  # 超时因子：deadline = creation + promised_steps * timeout_factor
+                 max_planned_stops: int = 20,  # 计划中最大 stop 数量
                  ):
         super().__init__()
 
@@ -995,6 +1098,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.reward_output_mode = str(reward_output_mode)
         self.enable_random_events = bool(enable_random_events)
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
+        
+        # ========== 调度模式与超时控制 ==========
+        self.dispatch_mode = str(dispatch_mode)  # "route_plan_only" or "legacy"
+        self.pickup_retry_policy = str(pickup_retry_policy)  # "front" or "back"
+        self.max_stop_retries = int(max_stop_retries)
+        self.timeout_factor = float(timeout_factor)
+        self.max_planned_stops = int(max_planned_stops)
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1058,6 +1168,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'orders_generated': 0,
             'orders_completed': 0,
             'orders_cancelled': 0,
+            'cancellation_reasons': {},  # 新增：按原因统计取消
             'revenue': 0,
             'costs': 0,
             'energy_consumed': 0,
@@ -1071,6 +1182,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'total_orders': 0,
             'completed_orders': 0,
             'cancelled_orders': 0,
+            'cancellation_reasons': {},  # 新增：按原因统计取消
             'total_delivery_time': 0,
             'total_revenue': 0,
             'total_cost': 0,
@@ -1206,7 +1318,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'charging_rate': random.uniform(10.0, 15.0),
                 'cancellation_rate': random.uniform(0.005, 0.015),
                 'total_distance_today': 0.0,
-                'planned_stops': deque(), # deque of stops: {'type':'P','merchant_id':mid} or {'type':'D','order_id':oid}
+                'planned_stops': deque(), # deque of stops: {'type':'P','merchant_id':mid, 'retry_count':0} or {'type':'D','order_id':oid, 'retry_count':0}
                 'cargo': set(),  # picked-up orders (order_ids) not yet delivered
                 'current_stop': None,
                 'route_committed': False,
@@ -1364,6 +1476,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # 动态事件
         self._process_events()
+        
+        # 检查订单超时（新增）
+        self._check_order_timeouts()
 
         # 清理过期分配
         self._cleanup_stale_assignments()
@@ -1474,6 +1589,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'orders_generated': 0,
             'orders_completed': 0,
             'orders_cancelled': 0,
+            'cancellation_reasons': {},
             'revenue': 0,
             'costs': 0,
             'energy_consumed': 0,
@@ -1810,36 +1926,179 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                          drone_id: int,
                          planned_stops: List[dict],
                          commit_orders: Optional[List[int]] = None,
-                         allow_busy: bool = True) -> None:
+                         allow_busy: bool = True) -> bool:
         """
         Apply a cross-merchant interleaved route plan.
-        planned_stops:
-            [{'type':'P','merchant_id':mid}, {'type':'D','order_id':oid}, ...]
-        Constraints (per your requirement):
-            - planned_stops must not include orders that are not READY at dispatch time.
-            - Pickup is executed only when arriving at that merchant stop.
-            - Delivery is executed only when arriving at that delivery stop.
-
-        Commit semantics:
-            commit_orders are moved READY -> ASSIGNED and assigned to this drone.
-            Orders are NOT marked PICKED_UP at commit time.
+        
+        Args:
+            drone_id: ID of the drone to assign the route to
+            planned_stops: List of stops in format:
+                [{'type':'P','merchant_id':mid}, {'type':'D','order_id':oid}, ...]
+            commit_orders: Optional list of order IDs to commit (defaults to all D stops)
+            allow_busy: Whether to allow assignment to busy drones
+            
+        Returns:
+            bool: True if route plan was successfully applied, False otherwise
+            
+        Route Plan Constraints (READY-only dispatch):
+            - All orders in planned_stops must be in READY status at dispatch time
+            - Each stop must be either {'type':'P','merchant_id':...} or {'type':'D','order_id':...}
+            - For each order, its pickup merchant P must appear before its delivery D
+            - Each order can appear at most once (one D stop per order)
+            - commit_orders must contain all orders appearing in D stops
+            - Total planned_stops must not exceed max_planned_stops
+            - Drone capacity must accommodate all committed orders
+            
+        Execution:
+            - commit_orders are moved READY -> ASSIGNED and assigned to this drone
+            - Orders are NOT marked PICKED_UP at commit time (only at P-stop arrival)
+            - Stops are executed sequentially; failed stops are retried based on pickup_retry_policy
         """
         if drone_id not in self.drones:
-            return
+            return False
         drone = self.drones[drone_id]
 
         if (not allow_busy) and drone['status'] != DroneStatus.IDLE:
-            return
+            return False
 
-        # Derive commit_orders if not provided
+        # ========== Validation 1: Check planned_stops structure and length ==========
+        if not planned_stops:
+            return False
+            
+        if len(planned_stops) > self.max_planned_stops:
+            print(f"[apply_route_plan] REJECTED: planned_stops length {len(planned_stops)} exceeds max {self.max_planned_stops}")
+            return False
+
+        # ========== Validation 2: Check stop types and structure ==========
+        for i, stop in enumerate(planned_stops):
+            if not isinstance(stop, dict):
+                print(f"[apply_route_plan] REJECTED: stop {i} is not a dict")
+                return False
+            
+            stype = stop.get('type')
+            if stype not in ('P', 'D'):
+                print(f"[apply_route_plan] REJECTED: stop {i} has invalid type '{stype}', must be 'P' or 'D'")
+                return False
+            
+            if stype == 'P':
+                if 'merchant_id' not in stop:
+                    print(f"[apply_route_plan] REJECTED: P stop {i} missing 'merchant_id'")
+                    return False
+                if stop['merchant_id'] not in self.merchants:
+                    print(f"[apply_route_plan] REJECTED: P stop {i} has invalid merchant_id {stop['merchant_id']}")
+                    return False
+            elif stype == 'D':
+                if 'order_id' not in stop:
+                    print(f"[apply_route_plan] REJECTED: D stop {i} missing 'order_id'")
+                    return False
+
+        # ========== Derive commit_orders if not provided ==========
         if commit_orders is None:
             commit_orders = []
             for st in planned_stops:
                 if st.get('type') == 'D' and 'order_id' in st:
-                    commit_orders.append(int(st['order_id']))
+                    try:
+                        oid = int(st['order_id'])
+                        commit_orders.append(oid)
+                    except (ValueError, TypeError):
+                        print(f"[apply_route_plan] REJECTED: Invalid order_id {st.get('order_id')}, must be integer")
+                        return False
             # unique, keep order
             commit_orders = list(dict.fromkeys(commit_orders))
 
+        # ========== Validation 3: Check all commit_orders exist and are READY ==========
+        for oid in commit_orders:
+            if oid not in self.orders:
+                print(f"[apply_route_plan] REJECTED: commit_order {oid} does not exist")
+                return False
+            
+            order = self.orders[oid]
+            if order['status'] != OrderStatus.READY:
+                print(f"[apply_route_plan] REJECTED: commit_order {oid} status is {order['status']}, must be READY")
+                return False
+            
+            if order.get('assigned_drone', -1) not in (-1, None):
+                print(f"[apply_route_plan] REJECTED: commit_order {oid} already assigned to drone {order['assigned_drone']}")
+                return False
+
+        # ========== Validation 4: Check capacity ==========
+        if len(commit_orders) > drone['max_capacity']:
+            print(f"[apply_route_plan] REJECTED: commit_orders count {len(commit_orders)} exceeds drone capacity {drone['max_capacity']}")
+            return False
+
+        # ========== Validation 5: P-before-D ordering and order uniqueness ==========
+        # Build merchant->order mapping from commit_orders
+        order_to_merchant = {}
+        for oid in commit_orders:
+            order = self.orders[oid]
+            order_to_merchant[oid] = order['merchant_id']
+        
+        # Track which orders have D stops
+        d_stop_orders = set()
+        for st in planned_stops:
+            if st.get('type') == 'D':
+                try:
+                    oid = int(st['order_id'])
+                    d_stop_orders.add(oid)
+                except (ValueError, TypeError, KeyError):
+                    print(f"[apply_route_plan] REJECTED: Invalid order_id in D stop")
+                    return False
+        
+        # Check each order appears at most once in D stops
+        d_order_counts = {}
+        for st in planned_stops:
+            if st.get('type') == 'D':
+                try:
+                    oid = int(st['order_id'])
+                    d_order_counts[oid] = d_order_counts.get(oid, 0) + 1
+                except (ValueError, TypeError, KeyError):
+                    # Already caught above, but be safe
+                    continue
+        
+        for oid, count in d_order_counts.items():
+            if count > 1:
+                print(f"[apply_route_plan] REJECTED: order {oid} appears {count} times in D stops, must appear at most once")
+                return False
+        
+        # Check P-before-D for each order
+        for oid in d_stop_orders:
+            if oid not in order_to_merchant:
+                print(f"[apply_route_plan] REJECTED: order {oid} in D stop but not in commit_orders")
+                return False
+            
+            required_merchant = order_to_merchant[oid]
+            
+            # Find positions of P(merchant) and D(order)
+            p_positions = []
+            d_position = None
+            
+            for i, st in enumerate(planned_stops):
+                if st.get('type') == 'P' and st.get('merchant_id') == required_merchant:
+                    p_positions.append(i)
+                elif st.get('type') == 'D':
+                    try:
+                        stop_oid = int(st.get('order_id'))
+                        if stop_oid == oid:
+                            d_position = i
+                    except (ValueError, TypeError):
+                        continue
+            
+            if d_position is None:
+                continue  # order in commit but no D stop is unusual but not invalid
+            
+            # Check that at least one P(merchant) appears before D(order)
+            if not any(p_pos < d_position for p_pos in p_positions):
+                print(f"[apply_route_plan] REJECTED: order {oid} requires P(merchant={required_merchant}) before D, but none found before position {d_position}")
+                return False
+
+        # ========== Validation 6: Consistency - all D-stop orders must be in commit_orders ==========
+        for oid in d_stop_orders:
+            if oid not in commit_orders:
+                print(f"[apply_route_plan] REJECTED: order {oid} in D stop but not in commit_orders")
+                return False
+
+        # ========== All validations passed - Apply the route plan ==========
+        
         # 1) Commit orders: only READY orders are allowed
         committed = []
         for oid in commit_orders:
@@ -1847,7 +2106,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if o is None:
                 continue
 
-            # Enforced by requirement: only READY can be in planned_stops/commit list
+            # Should already be validated, but double-check
             if o['status'] != OrderStatus.READY:
                 continue
             if o.get('assigned_drone', -1) not in (-1, None):
@@ -1861,19 +2120,36 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             committed.append(oid)
 
         if not committed:
-            return
+            return False
 
-        # 2) Install route plan
-        drone['planned_stops'] = deque(planned_stops)
+        # 2) Install route plan with retry counters initialized
+        stops_with_retry = []
+        for st in planned_stops:
+            stop_copy = st.copy()
+            stop_copy['retry_count'] = 0
+            stops_with_retry.append(stop_copy)
+        
+        drone['planned_stops'] = deque(stops_with_retry)
         drone['cargo'] = set()  # picked-up set starts empty
         drone['current_stop'] = None
         drone['route_committed'] = True
 
         # 3) Start execution: set target to the first stop
         self._set_next_target_from_plan(drone_id, drone)
+        
+        return True
 
     def _process_batch_assignment(self, drone_id, order_ids):
-        """环境内部执行批量订单分配：给 MPSO 调用"""
+        """
+        环境内部执行批量订单分配：给 MPSO 调用
+        
+        注意：在 route_plan_only 模式下，此方法不应被调用。
+        外部调度器应使用 apply_route_plan() 代替。
+        """
+        if self.dispatch_mode == "route_plan_only":
+            print(f"[WARNING] _process_batch_assignment called in route_plan_only mode. Use apply_route_plan() instead.")
+            return
+            
         if not order_ids:
             return
         drone = self.drones[drone_id]
@@ -1916,7 +2192,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone['current_batch_index'] = 0
 
     def _process_single_assignment(self, drone_id, order_id, allow_busy=False):
-        """处理单个订单分配（记录任务起点 + 走 StateManager）"""
+        """
+        处理单个订单分配（记录任务起点 + 走 StateManager）
+        
+        注意：在 route_plan_only 模式下，此方法不应被外部直接调用。
+        外部调度器应使用 apply_route_plan() 代替。
+        内部（如 _process_batch_assignment）可以调用。
+        """
+        # Note: We don't add guard here since _process_batch_assignment calls this internally
+        # and _process_batch_assignment already has the guard
+        
         if order_id not in self.orders or drone_id not in self.drones:
             return
 
@@ -1954,6 +2239,37 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             self._start_new_task(drone_id, drone, target_merchant_loc)
             self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT, target_merchant_loc)
+
+    def _check_order_timeouts(self):
+        """
+        Check for timed-out orders and cancel them.
+        
+        Timeout rule:
+            deadline = creation_time + promised_delivery_steps * timeout_factor
+            
+        An order times out if current_step > deadline and it's still active (not delivered/cancelled).
+        This applies to all statuses (PENDING, ACCEPTED, READY, ASSIGNED, PICKED_UP).
+        """
+        current_step = self.time_system.current_step
+        
+        for order_id in list(self.active_orders):
+            if order_id not in self.orders:
+                continue
+            
+            order = self.orders[order_id]
+            
+            # Skip already delivered or cancelled orders
+            if order['status'] in [OrderStatus.DELIVERED, OrderStatus.CANCELLED]:
+                continue
+            
+            # Calculate deadline
+            creation_time = order['creation_time']
+            promised_steps = self._get_promised_delivery_steps(order)
+            deadline = creation_time + int(promised_steps * self.timeout_factor)
+            
+            # Check if timed out
+            if current_step > deadline:
+                self._cancel_order(order_id, "timeout")
 
     # ------------------ 事件处理与移动 ------------------
 
@@ -2199,48 +2515,73 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # No stops left: end this route cleanly
         self._safe_reset_drone(drone_id, drone)
 
-    def _execute_pickup_stop(self, drone_id: int, drone: dict, stop: dict) -> None:
+    def _execute_pickup_stop(self, drone_id: int, drone: dict, stop: dict) -> bool:
         """
         Arrive at merchant mid: pick up only orders assigned to this drone AND belonging to this merchant.
         READY-only planning: orders should already be ASSIGNED here, but we still check status strictly.
+        
+        Returns:
+            bool: True if all expected orders were picked up, False if retry is needed
         """
         mid = stop.get('merchant_id', None)
         if mid is None:
-            return
-
+            return True  # Invalid stop, just skip
+        
+        # Find all orders that should be picked up at this merchant for this drone
+        expected_pickups = []
         for oid in list(self.active_orders):
             o = self.orders.get(oid)
             if o is None:
                 continue
+            # Only consider orders assigned to this specific drone
             if o.get('assigned_drone', -1) != drone_id:
                 continue
             if o.get('merchant_id', None) != mid:
                 continue
-            if o['status'] != OrderStatus.ASSIGNED:
-                continue
+            expected_pickups.append((oid, o))
+        
+        # If no orders expected at this merchant for this drone, that's OK
+        if not expected_pickups:
+            return True
+        
+        # Try to pick up each expected order
+        picked_count = 0
+        for oid, o in expected_pickups:
+            if o['status'] == OrderStatus.ASSIGNED:
+                self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP, reason=f"pickup_at_merchant_{mid}")
+                o['pickup_time'] = self.time_system.current_step
+                drone['cargo'].add(oid)
+                picked_count += 1
+        
+        # Return success if we picked up at least one order, or if there were no expected pickups
+        return picked_count > 0
 
-            self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP, reason=f"pickup_at_merchant_{mid}")
-            o['pickup_time'] = self.time_system.current_step
-            drone['cargo'].add(oid)
-
-    def _execute_delivery_stop(self, drone_id: int, drone: dict, stop: dict) -> None:
-        """Arrive at customer: deliver exactly the specified order (must be PICKED_UP)."""
+    def _execute_delivery_stop(self, drone_id: int, drone: dict, stop: dict) -> bool:
+        """
+        Arrive at customer: deliver exactly the specified order (must be PICKED_UP).
+        
+        Returns:
+            bool: True if order was delivered, False if retry is needed
+        """
         oid = stop.get('order_id', None)
         if oid is None or oid not in self.orders:
-            return
+            return True  # Invalid stop, just skip
 
         o = self.orders[oid]
         if o.get('assigned_drone', -1) != drone_id:
-            return
+            return True  # Not our order, skip
 
         # Strict legality for READY-only planning: must have been picked up at its merchant stop
         if o['status'] != OrderStatus.PICKED_UP:
-            return
+            # Order not picked up yet, need to retry
+            return False
 
         self._complete_order_delivery(oid, drone_id)
 
         if oid in drone.get('cargo', set()):
             drone['cargo'].remove(oid)
+        
+        return True
 
     def _safe_reset_drone(self, drone_id, drone):
         """唯一出口：整趟结算 + 清理 trip + 清理关联订单 + 返航"""
@@ -2339,28 +2680,94 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _handle_drone_arrival(self, drone_id, drone):
         """
-        Arrival handler:
-          - If planned_stops is present: execute interleaved multi-merchant pickup/delivery.
-          - Else: fallback to legacy single/batch logic.
+        Arrival handler with retry mechanism:
+          - If planned_stops is present: execute interleaved multi-merchant pickup/delivery with retry
+          - Else: fallback to legacy single/batch logic
+          
+        Retry Policy:
+          - If P-stop fails (incomplete pickup): retry based on pickup_retry_policy
+          - If D-stop fails (order not picked up): retry based on pickup_retry_policy
+          - Max retries controlled by max_stop_retries
         """
-        # -------- New route-plan logic (priority) --------
+        # -------- New route-plan logic with retry (priority) --------
         if drone.get('planned_stops') and len(drone['planned_stops']) > 0:
             stop = drone['planned_stops'][0]
             stype = stop.get('type', None)
+            retry_count = stop.get('retry_count', 0)
 
             if stype == 'P':
-                self._execute_pickup_stop(drone_id, drone, stop)
+                # Execute pickup and check success
+                success = self._execute_pickup_stop(drone_id, drone, stop)
+                
+                if success:
+                    # Pickup successful, remove stop and continue
+                    drone['planned_stops'].popleft()
+                    return self._set_next_target_from_plan(drone_id, drone)
+                else:
+                    # Pickup failed, retry if under threshold
+                    if retry_count < self.max_stop_retries:
+                        # Increment retry count
+                        stop['retry_count'] = retry_count + 1
+                        
+                        # Re-insert based on policy
+                        drone['planned_stops'].popleft()
+                        if self.pickup_retry_policy == "front":
+                            drone['planned_stops'].appendleft(stop)
+                        else:  # "back"
+                            drone['planned_stops'].append(stop)
+                        
+                        return self._set_next_target_from_plan(drone_id, drone)
+                    else:
+                        # Max retries exceeded, give up on this stop
+                        print(f"[Drone {drone_id}] P-stop at merchant {stop.get('merchant_id')} exceeded max retries, skipping")
+                        drone['planned_stops'].popleft()
+                        
+                        # Cancel or reset affected orders
+                        mid = stop.get('merchant_id')
+                        if mid:
+                            for oid in list(self.active_orders):
+                                o = self.orders.get(oid)
+                                if o and o.get('assigned_drone') == drone_id and o.get('merchant_id') == mid:
+                                    if o['status'] == OrderStatus.ASSIGNED:
+                                        self._reset_order_to_ready(oid, "pickup_retry_exceeded")
+                        
+                        return self._set_next_target_from_plan(drone_id, drone)
+
+            elif stype == 'D':
+                # Execute delivery and check success
+                success = self._execute_delivery_stop(drone_id, drone, stop)
+                
+                if success:
+                    # Delivery successful, remove stop and continue
+                    drone['planned_stops'].popleft()
+                    return self._set_next_target_from_plan(drone_id, drone)
+                else:
+                    # Delivery failed (order not picked up yet), retry if under threshold
+                    if retry_count < self.max_stop_retries:
+                        # Increment retry count
+                        stop['retry_count'] = retry_count + 1
+                        
+                        # Re-insert based on policy
+                        drone['planned_stops'].popleft()
+                        if self.pickup_retry_policy == "front":
+                            drone['planned_stops'].appendleft(stop)
+                        else:  # "back"
+                            drone['planned_stops'].append(stop)
+                        
+                        return self._set_next_target_from_plan(drone_id, drone)
+                    else:
+                        # Max retries exceeded, cancel the order
+                        oid = stop.get('order_id')
+                        if oid:
+                            print(f"[Drone {drone_id}] D-stop for order {oid} exceeded max retries, cancelling order")
+                            self._cancel_order(oid, "delivery_retry_exceeded")
+                        
+                        drone['planned_stops'].popleft()
+                        return self._set_next_target_from_plan(drone_id, drone)
+            else:
+                # Unknown stop type -> drop and continue
                 drone['planned_stops'].popleft()
                 return self._set_next_target_from_plan(drone_id, drone)
-
-            if stype == 'D':
-                self._execute_delivery_stop(drone_id, drone, stop)
-                drone['planned_stops'].popleft()
-                return self._set_next_target_from_plan(drone_id, drone)
-
-            # Unknown stop type -> drop and continue
-            drone['planned_stops'].popleft()
-            return self._set_next_target_from_plan(drone_id, drone)
 
         # -------- Legacy logic (unchanged) --------
         if drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
@@ -2402,7 +2809,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._clear_drone_batch_state(drone)
             self._clear_task_data(drone_id, drone)
 
-            # --- ADD: clear route-plan state ---
+            # --- Clear route-plan state ---
             drone['planned_stops'] = deque()
             drone['cargo'] = set()
             drone['current_stop'] = None
@@ -2492,6 +2899,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.cancelled_orders.add(order_id)
         self.metrics['cancelled_orders'] += 1
         self.daily_stats['orders_cancelled'] += 1
+        
+        # Track cancellation reasons
+        self.metrics['cancellation_reasons'][reason] = self.metrics['cancellation_reasons'].get(reason, 0) + 1
+        self.daily_stats['cancellation_reasons'][reason] = self.daily_stats['cancellation_reasons'].get(reason, 0) + 1
 
         drone_id = order.get('assigned_drone', -1)
         if drone_id is not None and 0 <= drone_id < self.num_drones:
