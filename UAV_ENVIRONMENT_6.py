@@ -2102,8 +2102,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     action_vec = headings[int(drone_id)]
                     ppo_hx, ppo_hy = action_vec[0], action_vec[1]
                     ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
+                    
                     # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
-                    # Formula: (u + 1) / 2 * (max - min) + min
+                    # Using standard linear interpolation: 
+                    #   normalized = (value - old_min) / (old_max - old_min)
+                    #   result = normalized * (new_max - new_min) + new_min
+                    # Here: old_range=[-1,1], new_range=[0.5,1.5]
                     normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
                     ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
                     ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
