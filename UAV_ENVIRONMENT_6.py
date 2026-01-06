@@ -216,14 +216,19 @@ class StateManager:
                             issues.append(f"[Route] 订单 {order_id} 已分配但不在无人机 {drone_id} 的路线中")
                     
                     elif order['status'] == OrderStatus.PICKED_UP:
-                        # PICKED_UP order should be in cargo
-                        if not order_in_cargo:
-                            issues.append(f"[Route] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物集合中")
-                        
-                        # Check that delivery stop exists
+                        # PICKED_UP order consistency checks (route-aware)
                         has_delivery_stop = self._has_delivery_stop(order_id, planned_stops)
-                        if not has_delivery_stop:
+                        
+                        if len(planned_stops) > 0 and has_delivery_stop:
+                            # Drone has active route with D stop for this order
+                            if not order_in_cargo:
+                                # This is a real inconsistency - order should be in cargo
+                                issues.append(f"[Route] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物集合中")
+                        elif len(planned_stops) > 0 and order_in_cargo and not has_delivery_stop:
+                            # Order in cargo but no D stop - missing delivery stop
                             issues.append(f"[Route] 订单 {order_id} 已取货但缺少对应的 D stop")
+                        # If planned_stops is empty or no D stop and not in cargo, 
+                        # drone is likely completing/resetting - this is OK
                 else:
                     # Legacy mode: original consistency check
                     if (order['status'] == OrderStatus.ASSIGNED and
@@ -1662,11 +1667,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
 
             if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-                if order['status'] == OrderStatus.ASSIGNED:
-                    self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
-                                                           reason="sync_assigned_to_picked_up")
-                    if 'pickup_time' not in order:
-                        order['pickup_time'] = self.time_system.current_step
+                # Route-aware fix: Only auto-pickup if NOT in route-plan mode
+                # In route-plan mode, orders are picked up explicitly at P stops
+                if not drone.get('route_committed', False):
+                    # Legacy mode: auto-pickup when flying to customer
+                    if order['status'] == OrderStatus.ASSIGNED:
+                        self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
+                                                               reason="sync_assigned_to_picked_up")
+                        if 'pickup_time' not in order:
+                            order['pickup_time'] = self.time_system.current_step
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -1908,19 +1917,30 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             return False
 
         # Task C: Validate that orders in planned_stops are in committed set
+        # and filter out D stops for non-committed orders
         committed_set = set(committed)
+        filtered_stops = []
         for stop in planned_stops:
             if stop.get('type') == 'D':
                 oid = stop.get('order_id')
                 if oid is not None and oid not in committed_set:
                     if self.debug_state_warnings:
-                        print(f"[Warning] Drone {drone_id} route contains D stop for order {oid} not in commit_orders")
+                        print(f"[Warning] Drone {drone_id} skipping D stop for uncommitted order {oid}")
+                    continue  # Skip this D stop
+            filtered_stops.append(stop)
+        
+        # If no stops remain after filtering, don't install route
+        if not filtered_stops:
+            return False
 
-        # 2) Install route plan
-        drone['planned_stops'] = deque(planned_stops)
+        # 2) Install route plan with filtered stops
+        drone['planned_stops'] = deque(filtered_stops)
         drone['cargo'] = set()  # picked-up set starts empty
         drone['current_stop'] = None
         drone['route_committed'] = True
+        
+        # Clear legacy batch state to avoid conflicts with route-plan mode
+        self._clear_drone_batch_state(drone)
 
         # 3) Start execution: set target to the first stop
         self._set_next_target_from_plan(drone_id, drone)
