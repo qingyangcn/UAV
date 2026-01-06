@@ -46,7 +46,10 @@ class MOPSOPlanner:
                  c1: float = 1.4,
                  c2: float = 1.4,
                  archive_size: int = 50,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None,
+                 # Conservative ETA parameters
+                 eta_speed_scale_assumption: float = 0.7,
+                 eta_stop_service_steps: int = 1):
         """
         Initialize MOPSO planner.
         
@@ -60,6 +63,8 @@ class MOPSOPlanner:
             c2: Social parameter
             archive_size: Maximum Pareto archive size
             seed: Random seed
+            eta_speed_scale_assumption: Conservative speed scale for ETA (default 0.7)
+            eta_stop_service_steps: Service time per stop in steps (default 1)
         """
         self.n_particles = n_particles
         self.n_iterations = n_iterations
@@ -70,6 +75,10 @@ class MOPSOPlanner:
         self.c2 = c2
         self.archive_size = archive_size
         self.rng = np.random.RandomState(seed)
+        
+        # Conservative ETA parameters for fitness calculation
+        self.eta_speed_scale_assumption = float(eta_speed_scale_assumption)
+        self.eta_stop_service_steps = int(eta_stop_service_steps)
         
         # Pareto archive
         self.archive = []
@@ -358,8 +367,12 @@ class MOPSOPlanner:
             
             total_distance += route_distance
             
-            # Estimate timeout orders
-            estimated_time = route_distance / (drone['speed'] * speed_factor + EPSILON)
+            # Estimate timeout orders using conservative ETA
+            # Apply conservative speed scale and add service time per stop
+            conservative_speed = drone['speed'] * speed_factor * self.eta_speed_scale_assumption
+            num_stops = len(stops)
+            service_time = num_stops * self.eta_stop_service_steps
+            estimated_time = (route_distance / (conservative_speed + EPSILON)) + service_time
             
             for order_id in order_ids:
                 order = order_map.get(order_id)

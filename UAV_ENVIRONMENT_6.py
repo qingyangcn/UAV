@@ -1015,6 +1015,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,# 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
+                 # ===== Training stabilizers =====
+                 throttle_warmup_steps: int = 0,
+                 throttle_warmup_min_u: float = 1.0,
                  ):
         super().__init__()
 
@@ -1041,6 +1044,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.enable_random_events = bool(enable_random_events)
         self.debug_state_warnings = bool(debug_state_warnings)  # Task B: debug flag
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
+        
+        # ========== Training stabilizers ==========
+        self.throttle_warmup_steps = int(throttle_warmup_steps)
+        self.throttle_warmup_min_u = float(throttle_warmup_min_u)
+        self.steps_since_reset = 0
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1157,6 +1165,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 订单ID计数器
         self.global_order_counter = 0
         self.current_obs_order_ids = []
+        
+        # ========== Diagnostics tracking ==========
+        self.diagnostics = {
+            # Lateness tracking (per delivered order)
+            'lateness_steps': [],
+            # Slack tracking (at assignment time)
+            'assign_slack_steps': [],
+            # Speed scale tracking (per drone per step)
+            'speed_scale_per_step': [],
+        }
 
     # ------------------ 初始化相关 ------------------
 
@@ -1364,6 +1382,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.overtime_steps = 0
         self._assigned_in_step = set()
         self.pending_distance_reward = 0.0
+        
+        # Reset diagnostics
+        self.diagnostics = {
+            'lateness_steps': [],
+            'assign_slack_steps': [],
+            'speed_scale_per_step': [],
+        }
+        self.steps_since_reset = 0
 
         # ====== 多目标权重：每个 episode 一个偏好 ======
         if self.multi_objective_mode == "conditioned":
@@ -1390,6 +1416,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """执行一步环境动作"""
         self._assigned_in_step = set()
         self._last_route_heading = action
+        self.steps_since_reset += 1
 
         day_ended = self.time_system.step()
         time_state = self.time_system.get_time_state()
@@ -1914,6 +1941,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             o['assigned_drone'] = drone_id
             drone['current_load'] += 1
             committed.append(oid)
+            
+            # Track slack at assignment time for diagnostics
+            promised_steps = self._get_promised_delivery_steps(o)
+            deadline_step = o['creation_time'] + promised_steps
+            slack = deadline_step - self.time_system.current_step
+            self.diagnostics['assign_slack_steps'].append(slack)
 
         if not committed:
             return False
@@ -2225,6 +2258,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     ppo_hx, ppo_hy = action_vec[0], action_vec[1]
                     ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
                     
+                    # Throttle warmup: clamp u during warmup period
+                    if self.throttle_warmup_steps > 0 and self.steps_since_reset <= self.throttle_warmup_steps:
+                        # Force u to be at least throttle_warmup_min_u
+                        # u is in [-1, 1], map min_u to same scale
+                        # min_u=1.0 in real scale corresponds to u=0 in [-1,1]
+                        # We want: mapped_u >= min_u
+                        # After mapping: normalized_u * (1.5 - 0.5) + 0.5 >= min_u
+                        # normalized_u >= (min_u - 0.5) / 1.0
+                        # (ppo_u + 1) / 2 >= (min_u - 0.5)
+                        # ppo_u >= 2 * (min_u - 0.5) - 1
+                        min_u_in_action_space = 2.0 * (self.throttle_warmup_min_u - SPEED_MULTIPLIER_MIN) / (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) - 1.0
+                        ppo_u = max(ppo_u, min_u_in_action_space)
+                    
                     # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
                     # Using standard linear interpolation: 
                     #   normalized = (value - old_min) / (old_max - old_min)
@@ -2233,6 +2279,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
                     ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
                     ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
+                    
+                    # Track speed_scale for diagnostics
+                    self.diagnostics['speed_scale_per_step'].append(ppo_u)
 
                 ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
                 if ppo_norm > 1e-6:
@@ -2629,6 +2678,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if delivery_duration <= promised_steps:
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
+        
+        # Track lateness for diagnostics
+        deadline_step = order['creation_time'] + promised_steps
+        lateness = order['delivery_time'] - deadline_step
+        self.diagnostics['lateness_steps'].append(lateness)
 
         weather_key = f"{self.weather.name.lower()}_deliveries"
         if weather_key in self.metrics['weather_impact_stats']:
@@ -3013,6 +3067,30 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"  完成订单: {self.daily_stats['orders_completed']}")
         print(f"  取消订单: {self.daily_stats['orders_cancelled']}")
         print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
+        
+        # Print diagnostics summary
+        if self.diagnostics['lateness_steps']:
+            lateness_arr = np.array(self.diagnostics['lateness_steps'])
+            on_time = int(np.sum(lateness_arr <= 0))
+            print(f"\n诊断指标 - 送达延迟:")
+            print(f"  平均延迟: {np.mean(lateness_arr):.2f} steps")
+            print(f"  P90延迟: {np.percentile(lateness_arr, 90):.2f} steps")
+            print(f"  最大延迟: {np.max(lateness_arr):.2f} steps")
+            print(f"  准时率: {on_time}/{len(lateness_arr)} ({100*on_time/len(lateness_arr):.1f}%)")
+        
+        if self.diagnostics['assign_slack_steps']:
+            slack_arr = np.array(self.diagnostics['assign_slack_steps'])
+            print(f"\n诊断指标 - 分配时余裕:")
+            print(f"  平均余裕: {np.mean(slack_arr):.2f} steps")
+            print(f"  P10余裕: {np.percentile(slack_arr, 10):.2f} steps")
+            print(f"  最小余裕: {np.min(slack_arr):.2f} steps")
+        
+        if self.diagnostics['speed_scale_per_step']:
+            speed_arr = np.array(self.diagnostics['speed_scale_per_step'])
+            print(f"\n诊断指标 - PPO速度倍数:")
+            print(f"  平均速度: {np.mean(speed_arr):.3f}")
+            print(f"  P10速度: {np.percentile(speed_arr, 10):.3f}")
+            print(f"  P90速度: {np.percentile(speed_arr, 90):.3f}")
 
         unfinished_orders = list(self.active_orders)
         for order_id in unfinished_orders:
@@ -3183,6 +3261,54 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         pass
 
     def _get_info(self):
+        # Compute diagnostics aggregates
+        diagnostics_summary = {}
+        
+        # Lateness statistics
+        if self.diagnostics['lateness_steps']:
+            lateness_arr = np.array(self.diagnostics['lateness_steps'])
+            diagnostics_summary['lateness_mean'] = float(np.mean(lateness_arr))
+            diagnostics_summary['lateness_p90'] = float(np.percentile(lateness_arr, 90))
+            diagnostics_summary['lateness_max'] = float(np.max(lateness_arr))
+            diagnostics_summary['lateness_min'] = float(np.min(lateness_arr))
+            diagnostics_summary['on_time_count'] = int(np.sum(lateness_arr <= 0))
+            diagnostics_summary['delivered_count'] = len(lateness_arr)
+        else:
+            diagnostics_summary['lateness_mean'] = 0.0
+            diagnostics_summary['lateness_p90'] = 0.0
+            diagnostics_summary['lateness_max'] = 0.0
+            diagnostics_summary['lateness_min'] = 0.0
+            diagnostics_summary['on_time_count'] = 0
+            diagnostics_summary['delivered_count'] = 0
+        
+        # Slack statistics
+        if self.diagnostics['assign_slack_steps']:
+            slack_arr = np.array(self.diagnostics['assign_slack_steps'])
+            diagnostics_summary['assign_slack_mean'] = float(np.mean(slack_arr))
+            diagnostics_summary['assign_slack_p10'] = float(np.percentile(slack_arr, 10))
+            diagnostics_summary['assign_slack_min'] = float(np.min(slack_arr))
+            diagnostics_summary['assign_slack_max'] = float(np.max(slack_arr))
+        else:
+            diagnostics_summary['assign_slack_mean'] = 0.0
+            diagnostics_summary['assign_slack_p10'] = 0.0
+            diagnostics_summary['assign_slack_min'] = 0.0
+            diagnostics_summary['assign_slack_max'] = 0.0
+        
+        # Speed scale statistics
+        if self.diagnostics['speed_scale_per_step']:
+            speed_arr = np.array(self.diagnostics['speed_scale_per_step'])
+            diagnostics_summary['speed_scale_mean'] = float(np.mean(speed_arr))
+            diagnostics_summary['speed_scale_p10'] = float(np.percentile(speed_arr, 10))
+            diagnostics_summary['speed_scale_p90'] = float(np.percentile(speed_arr, 90))
+            diagnostics_summary['speed_scale_min'] = float(np.min(speed_arr))
+            diagnostics_summary['speed_scale_max'] = float(np.max(speed_arr))
+        else:
+            diagnostics_summary['speed_scale_mean'] = 0.0
+            diagnostics_summary['speed_scale_p10'] = 0.0
+            diagnostics_summary['speed_scale_p90'] = 0.0
+            diagnostics_summary['speed_scale_min'] = 0.0
+            diagnostics_summary['speed_scale_max'] = 0.0
+        
         info = {
             'metrics': self.metrics.copy(),
             'daily_stats': self.daily_stats.copy(),
@@ -3198,7 +3324,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'avg_distance': np.mean([o['distance'] for o in self.order_history]) if self.order_history else 0
             },
             'time_state': self.time_system.get_time_state(),
-            'backlog_size': len(self.active_orders)
+            'backlog_size': len(self.active_orders),
+            'diagnostics': diagnostics_summary
         }
 
         if self.daily_stats['orders_completed'] > 0:
