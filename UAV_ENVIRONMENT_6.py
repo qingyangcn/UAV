@@ -1244,9 +1244,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # PPO：只输出 heading
+        # PPO：输出 heading (hx, hy) + speed multiplier (u)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
+            low=-1.0, high=1.0, shape=(self.num_drones, 3), dtype=np.float32,
         )
 
     # ------------------ 时间单位统一：minutes <-> steps ------------------
@@ -2090,9 +2090,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     continue
 
                 if headings is None:
-                    ppo_hx, ppo_hy = 0.0, 0.0
+                    ppo_hx, ppo_hy, ppo_u = 0.0, 0.0, 1.0
                 else:
-                    ppo_hx, ppo_hy = headings[int(drone_id)]
+                    # Extract (hx, hy, u) from action - u is speed multiplier
+                    action_vec = headings[int(drone_id)]
+                    ppo_hx, ppo_hy = action_vec[0], action_vec[1]
+                    ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
+                    # Clip speed multiplier to [0.5, 1.5] for reasonable range
+                    ppo_u = np.clip((ppo_u + 1.0) / 2.0, 0.5, 1.5)
 
                 ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
                 if ppo_norm > 1e-6:
@@ -2114,7 +2119,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 else:
                     move_hx, move_hy = tgt_hx, tgt_hy
 
-                step_len = min(speed, dist_to_target)
+                # Apply speed multiplier from PPO action
+                step_len = min(speed * ppo_u, dist_to_target)
                 nx = float(np.clip(cx + move_hx * step_len, 0, self.grid_size - 1))
                 ny = float(np.clip(cy + move_hy * step_len, 0, self.grid_size - 1))
 
@@ -3119,3 +3125,93 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 status_count['charging'] += 1
 
         return status_count
+
+    # ------------------ Snapshot interfaces for MOPSO ------------------
+
+    def get_ready_orders_snapshot(self, limit: int = 200) -> List[dict]:
+        """
+        Get snapshot of READY orders for MOPSO scheduling.
+        Returns list of order dicts with essential fields.
+        """
+        ready_orders = []
+        for oid in self.active_orders:
+            if oid not in self.orders:
+                continue
+            order = self.orders[oid]
+            if order['status'] != OrderStatus.READY:
+                continue
+            if order.get('assigned_drone', -1) not in (-1, None):
+                continue
+            
+            # Create snapshot with essential fields
+            snapshot = {
+                'order_id': oid,
+                'merchant_id': order['merchant_id'],
+                'merchant_location': order['merchant_location'],
+                'customer_location': order['customer_location'],
+                'creation_time': order['creation_time'],
+                'deadline_step': order.get('deadline_step', self.time_system.current_step + 100),
+                'urgent': order.get('urgent', False),
+                'distance': order.get('distance', 0.0),
+            }
+            ready_orders.append(snapshot)
+            
+            if len(ready_orders) >= limit:
+                break
+        
+        return ready_orders
+
+    def get_drones_snapshot(self) -> List[dict]:
+        """
+        Get snapshot of all drones for MOPSO scheduling.
+        Returns list of drone dicts with essential fields.
+        """
+        drones_snapshot = []
+        for drone_id, drone in self.drones.items():
+            snapshot = {
+                'drone_id': drone_id,
+                'location': drone['location'],
+                'base': drone['base'],
+                'status': drone['status'],
+                'battery_level': drone['battery_level'],
+                'current_load': drone['current_load'],
+                'max_capacity': drone['max_capacity'],
+                'speed': drone['speed'],
+                'battery_consumption_rate': drone['battery_consumption_rate'],
+                'has_route': drone.get('route_committed', False),
+            }
+            drones_snapshot.append(snapshot)
+        
+        return drones_snapshot
+
+    def get_merchants_snapshot(self) -> Dict[str, dict]:
+        """
+        Get snapshot of all merchants for MOPSO scheduling.
+        Returns dict mapping merchant_id to merchant info.
+        """
+        merchants_snapshot = {}
+        for merchant_id, merchant in self.merchants.items():
+            snapshot = {
+                'merchant_id': merchant_id,
+                'location': merchant['location'],
+                'queue_length': len(merchant.get('queue', [])),
+                'cancellation_rate': merchant.get('cancellation_rate', 0.01),
+                'landing_zone': merchant.get('landing_zone', True),
+            }
+            merchants_snapshot[merchant_id] = snapshot
+        
+        return merchants_snapshot
+
+    def get_route_plan_constraints(self) -> dict:
+        """
+        Get constraints for route plan generation.
+        Returns dict with constraint parameters.
+        """
+        constraints = {
+            'grid_size': self.grid_size,
+            'current_step': self.time_system.current_step,
+            'max_capacity_per_drone': self.drone_max_capacity,
+            'weather_speed_factor': self._get_weather_speed_factor(),
+            'weather_battery_factor': self._get_weather_battery_factor(),
+        }
+        return constraints
