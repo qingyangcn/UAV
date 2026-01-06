@@ -969,7 +969,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  num_bases: Optional[int] = None,
                  top_k_merchants: int = 100,
                  reward_output_mode: str = "zero",
-                 enable_random_events: bool = True,# 可选：评估时建议关掉随机事件
+                 enable_random_events: bool = True,  # 可选：评估时建议关掉随机事件
+                 # ===== P0-3/P1-3: Timeout & Stuck Order Parameters =====
+                 timeout_factor: float = 2.0,
+                 stuck_assigned_reset_threshold: int = 20,
+                 stuck_assigned_cancel_threshold: int = 50,
+                 stuck_picked_up_retry_threshold: int = 30,
+                 stuck_picked_up_force_threshold: int = 80,
                  ):
         super().__init__()
 
@@ -1003,11 +1009,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._prev_target_dist = np.zeros(self.num_drones, dtype=np.float32)
 
         # ========== P0-3/P1-3: Timeout & Stuck Order Parameters ==========
-        self.timeout_factor = 2.0  # SLA multiplier for deadline calculation
-        self.stuck_assigned_reset_threshold = 20  # steps before resetting ASSIGNED to READY
-        self.stuck_assigned_cancel_threshold = 50  # steps before canceling stuck ASSIGNED
-        self.stuck_picked_up_retry_threshold = 30  # steps before retrying PICKED_UP delivery
-        self.stuck_picked_up_force_threshold = 80  # steps before force-completing PICKED_UP
+        self.timeout_factor = float(timeout_factor)
+        self.stuck_assigned_reset_threshold = int(stuck_assigned_reset_threshold)
+        self.stuck_assigned_cancel_threshold = int(stuck_assigned_cancel_threshold)
+        self.stuck_picked_up_retry_threshold = int(stuck_picked_up_retry_threshold)
+        self.stuck_picked_up_force_threshold = int(stuck_picked_up_force_threshold)
 
         # ====== 时间系统（先建立，后续多个组件要用）======
         start_hour, end_hour = operating_hours
@@ -3111,8 +3117,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             age_steps = current_step - order['creation_time']
             promised_steps = self._get_promised_delivery_steps(order)
             # deadline_step = creation_time + promised_steps * timeout_factor
-            timeout_factor = getattr(self, 'timeout_factor', 2.0)
-            deadline_step = order['creation_time'] + int(promised_steps * timeout_factor)
+            deadline_step = order['creation_time'] + int(promised_steps * self.timeout_factor)
             
             order_snapshot = {
                 'order_id': int(order['id']),
@@ -3198,7 +3203,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'speed_multiplier_range': [0.5, 1.5],  # Not currently used but for future
             'max_stops_per_route': int(self.drone_max_capacity * 2),  # P+D for each order
             'max_capacity': int(self.drone_max_capacity),
-            'timeout_factor': float(getattr(self, 'timeout_factor', 2.0)),
+            'timeout_factor': float(self.timeout_factor),
             'retry_strategy': 'reset_to_ready_on_timeout',
             'grid_size': int(self.grid_size),
             'num_drones': int(self.num_drones),
@@ -3372,11 +3377,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         
         current_step = self.time_system.current_step
         
-        # Thresholds (in steps)
-        assigned_reset_threshold = getattr(self, 'stuck_assigned_reset_threshold', 20)
-        assigned_cancel_threshold = getattr(self, 'stuck_assigned_cancel_threshold', 50)
-        picked_up_retry_threshold = getattr(self, 'stuck_picked_up_retry_threshold', 30)
-        picked_up_force_threshold = getattr(self, 'stuck_picked_up_force_threshold', 80)
+        # Thresholds (in steps) - use instance variables
+        assigned_reset_threshold = self.stuck_assigned_reset_threshold
+        assigned_cancel_threshold = self.stuck_assigned_cancel_threshold
+        picked_up_retry_threshold = self.stuck_picked_up_retry_threshold
+        picked_up_force_threshold = self.stuck_picked_up_force_threshold
         
         for order_id in list(self.active_orders):
             order = self.orders.get(order_id)
@@ -3520,11 +3525,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'avg_distance_per_order': float(total_actual_distance / max(1, completed_orders)),
         }
         
-        # Speed multiplier stats (placeholder - would need to track actual speed decisions)
-        # For now, report basic stats
+        # Speed multiplier stats (placeholder for future enhancement)
+        # Current implementation uses fixed heading_guidance_alpha, not dynamic speed multipliers
+        # To be implemented: track actual speed multiplier decisions from PPO action space
         metrics['speed_stats'] = {
-            'mean': 1.0,  # Placeholder
-            'std': 0.0,   # Placeholder
+            'mean': 1.0,  # TODO: Track actual speed multiplier from actions
+            'std': 0.0,   # TODO: Track variance of speed multipliers
         }
         
         return metrics

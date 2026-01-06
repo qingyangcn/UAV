@@ -154,9 +154,9 @@ def test_apply_route_plan():
         print(f"  Route installed: {result['route_installed']}")
         print(f"  Reason: {result['reason']}")
         
-        assert result['success'] == True
+        assert result['success']
         assert len(result['committed_orders']) > 0
-        assert result['route_installed'] == True
+        assert result['route_installed']
         print("✓ Successful route plan test passed")
         
         # Test invalid drone
@@ -165,7 +165,7 @@ def test_apply_route_plan():
             drone_id=999,
             planned_stops=planned_stops,
         )
-        assert result['success'] == False
+        assert not result['success']
         assert 'Invalid drone_id' in result['reason']
         print(f"✓ Invalid drone rejection: {result['reason']}")
         
@@ -175,7 +175,7 @@ def test_apply_route_plan():
             drone_id=1,
             planned_stops=[],
         )
-        assert result['success'] == False
+        assert not result['success']
         print(f"✓ Empty stops rejection: {result['reason']}")
     
     print("\n✓ All apply_route_plan tests passed!")
