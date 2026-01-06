@@ -1,3 +1,100 @@
+"""
+UAV Food Delivery Environment (Version 6)
+==========================================
+
+Multi-objective drone delivery optimization environment with route planning support.
+
+Key Features:
+-------------
+1. **Unified Route Planning Dispatch**
+   - External PSO scheduler uses `apply_route_plan()` to assign routes
+   - Supports interleaved multi-merchant pickup/delivery
+   - READY-only order dispatch (PSO only sees READY orders)
+   
+2. **Route Plan Validation**
+   - Validates stop structure (P/D types only)
+   - Enforces P-before-D ordering for each order
+   - Checks capacity constraints
+   - Validates order uniqueness and consistency
+   
+3. **Retry Mechanism**
+   - Failed pickup/delivery stops are retried (not discarded)
+   - Configurable retry policy: "front" or "back"
+   - Max retry threshold with degradation handling
+   
+4. **Timeout and Cancellation**
+   - Order timeout based on creation_time + promised_steps * timeout_factor
+   - Tracks cancellation reasons in metrics
+   - Prevents orders from hanging indefinitely
+   
+5. **PPO Heading Control**
+   - PPO outputs heading direction for drones
+   - Configurable alpha blending with target direction
+   - Fallback to target when PPO output is near zero
+   
+6. **Controllable Random Events**
+   - `enable_random_events` strictly controls random cancellations/address changes
+   - Deterministic mode for evaluation
+   - Seed-based reproducibility
+
+Configuration Parameters:
+-------------------------
+- `dispatch_mode`: "route_plan_only" (default) or "legacy"
+  - "route_plan_only": Only apply_route_plan() can assign orders
+  - "legacy": Allows internal auto-assignment (not recommended)
+  
+- `pickup_retry_policy`: "back" (default) or "front"
+  - Controls where failed stops are re-inserted in the queue
+  
+- `max_stop_retries`: Maximum retry attempts per stop (default: 3)
+- `timeout_factor`: Multiplier for order timeout deadline (default: 2.0)
+- `max_planned_stops`: Maximum stops in a route plan (default: 20)
+- `enable_random_events`: Enable/disable random events (default: True)
+
+Usage Example:
+--------------
+```python
+from UAV_ENVIRONMENT_6 import ThreeObjectiveDroneDeliveryEnv
+
+env = ThreeObjectiveDroneDeliveryEnv(
+    dispatch_mode="route_plan_only",
+    pickup_retry_policy="back",
+    max_stop_retries=3,
+    timeout_factor=2.0,
+    enable_random_events=False  # For evaluation
+)
+
+obs, info = env.reset(seed=42)
+
+# External PSO assigns route
+ready_orders = [oid for oid in env.active_orders 
+                if env.orders[oid]['status'] == OrderStatus.READY]
+route_plan = [
+    {'type': 'P', 'merchant_id': 'm1'},
+    {'type': 'D', 'order_id': ready_orders[0]},
+    # ... more stops
+]
+success = env.apply_route_plan(drone_id=0, planned_stops=route_plan)
+
+# PPO controls heading
+action = ppo_policy(obs)  # shape: (num_drones, 2)
+obs, reward, done, truncated, info = env.step(action)
+```
+
+Route Plan Format:
+------------------
+Each stop in `planned_stops` must be one of:
+- Pickup: `{'type': 'P', 'merchant_id': <merchant_id>}`
+- Delivery: `{'type': 'D', 'order_id': <order_id>}`
+
+Constraints:
+- All orders must be in READY status
+- P(merchant) must appear before D(order) for that order's merchant
+- Each order can appear at most once (one D stop)
+- Total stops must not exceed max_planned_stops
+- Committed orders must not exceed drone capacity
+"""
+
 import pandas as pd
 import numpy as np
 import gymnasium as gym
