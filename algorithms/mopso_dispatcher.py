@@ -503,13 +503,20 @@ def apply_mopso_dispatch(env, planner: Optional[MOPSOPlanner] = None, **kwargs):
     
     plans = planner.mopso_dispatch(env)
     
-    # Apply plans to environment
+    # Apply plans to environment (Task D: handle return value)
     applied_count = 0
+    failed_count = 0
     for drone_id, (planned_stops, commit_orders) in plans.items():
         try:
-            env.apply_route_plan(drone_id, planned_stops, commit_orders, allow_busy=False)
-            applied_count += 1
+            success = env.apply_route_plan(drone_id, planned_stops, commit_orders, allow_busy=False)
+            if success:
+                applied_count += 1
+            else:
+                failed_count += 1
+                if hasattr(env, 'debug_state_warnings') and env.debug_state_warnings:
+                    print(f"Warning: Failed to apply plan for drone {drone_id} (returned False)")
         except Exception as e:
-            print(f"Warning: Failed to apply plan for drone {drone_id}: {e}")
+            failed_count += 1
+            print(f"Warning: Exception applying plan for drone {drone_id}: {e}")
     
     return plans
