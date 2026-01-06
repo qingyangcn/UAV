@@ -80,6 +80,10 @@ class MOPSOPlanner:
         self.eta_speed_scale_assumption = float(eta_speed_scale_assumption)
         self.eta_stop_service_steps = int(eta_stop_service_steps)
         
+        # Validate parameters
+        if self.eta_speed_scale_assumption <= 0 or self.eta_speed_scale_assumption > 2.0:
+            raise ValueError(f"eta_speed_scale_assumption must be in (0, 2.0], got {self.eta_speed_scale_assumption}")
+        
         # Pareto archive
         self.archive = []
     

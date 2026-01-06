@@ -2208,6 +2208,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 # Ensure target_location matches stop location
                 if loc and drone.get('target_location') != loc:
                     drone['target_location'] = loc
+    
+    def _map_action_u_to_speed_scale(self, action_u: float) -> float:
+        """
+        Map PPO action u from [-1, 1] to actual speed scale [0.5, 1.5].
+        
+        Args:
+            action_u: Action value in range [-1, 1]
+        
+        Returns:
+            Speed scale in range [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
+        """
+        # Linear interpolation from [-1, 1] to [0.5, 1.5]
+        normalized = (action_u + 1.0) / 2.0  # Map to [0, 1]
+        speed_scale = normalized * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
+        return float(np.clip(speed_scale, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX))
 
     def _update_drone_positions(self):
         # Sync drone status with route plan at the start of position update
@@ -2251,37 +2266,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     continue
 
                 if headings is None:
-                    ppo_hx, ppo_hy, ppo_u = 0.0, 0.0, 1.0
+                    ppo_hx, ppo_hy = 0.0, 0.0
+                    speed_scale = 1.0  # Default speed
                 else:
                     # Extract (hx, hy, u) from action - u is speed multiplier
                     action_vec = headings[int(drone_id)]
                     ppo_hx, ppo_hy = action_vec[0], action_vec[1]
                     ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
                     
-                    # Throttle warmup: clamp u during warmup period
+                    # Throttle warmup: enforce minimum speed during warmup period
+                    # This prevents PPO from learning to fly too slowly before understanding the task
                     if self.throttle_warmup_steps > 0 and self.steps_since_reset <= self.throttle_warmup_steps:
-                        # Force u to be at least throttle_warmup_min_u
-                        # u is in [-1, 1], map min_u to same scale
-                        # min_u=1.0 in real scale corresponds to u=0 in [-1,1]
-                        # We want: mapped_u >= min_u
-                        # After mapping: normalized_u * (1.5 - 0.5) + 0.5 >= min_u
-                        # normalized_u >= (min_u - 0.5) / 1.0
-                        # (ppo_u + 1) / 2 >= (min_u - 0.5)
-                        # ppo_u >= 2 * (min_u - 0.5) - 1
-                        min_u_in_action_space = 2.0 * (self.throttle_warmup_min_u - SPEED_MULTIPLIER_MIN) / (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) - 1.0
-                        ppo_u = max(ppo_u, min_u_in_action_space)
+                        # Map minimum speed to action space, then clamp
+                        # E.g., min_u=1.0 → action_space 0.0, since 1.0 is center of [0.5, 1.5]
+                        min_u_action = 2.0 * (self.throttle_warmup_min_u - SPEED_MULTIPLIER_MIN) / (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) - 1.0
+                        ppo_u = max(ppo_u, min_u_action)
                     
-                    # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
-                    # Using standard linear interpolation: 
-                    #   normalized = (value - old_min) / (old_max - old_min)
-                    #   result = normalized * (new_max - new_min) + new_min
-                    # Here: old_range=[-1,1], new_range=[0.5,1.5]
-                    normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
-                    ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
-                    ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
+                    # Map action u to actual speed scale [0.5, 1.5]
+                    speed_scale = self._map_action_u_to_speed_scale(ppo_u)
                     
                     # Track speed_scale for diagnostics
-                    self.diagnostics['speed_scale_per_step'].append(ppo_u)
+                    self.diagnostics['speed_scale_per_step'].append(speed_scale)
 
                 ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
                 if ppo_norm > 1e-6:
@@ -2304,7 +2309,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     move_hx, move_hy = tgt_hx, tgt_hy
 
                 # Apply speed multiplier from PPO action
-                step_len = min(speed * ppo_u, dist_to_target)
+                step_len = min(speed * speed_scale, dist_to_target)
                 nx = float(np.clip(cx + move_hx * step_len, 0, self.grid_size - 1))
                 ny = float(np.clip(cy + move_hy * step_len, 0, self.grid_size - 1))
 
