@@ -2673,7 +2673,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        # Use READY-based deadline for on-time calculation and lateness tracking
+        # Use READY-based SLA for on-time calculation and lateness tracking
+        # Note: Lateness uses pure SLA (not timeout_factor), as timeout is for cancellation only
         # Lateness = delivery_time - (ready_step + sla_steps)
         # Use ready_step with creation_time as fallback if ready_step wasn't set
         ready_step = order.get('ready_step')
