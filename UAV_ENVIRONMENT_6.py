@@ -14,6 +14,13 @@ from sklearn.cluster import KMeans
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
+# ===== Constants for action processing =====
+SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
+SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
+
+
+# Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
+
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -143,6 +150,11 @@ class StateManager:
         old_status = order['status']
         order['status'] = new_status
 
+        # Record ready_step when transitioning to READY for the first time
+        if new_status == OrderStatus.READY and old_status != OrderStatus.READY:
+            if order.get('ready_step') is None:
+                order['ready_step'] = self.env.time_system.current_step
+
         # 记录状态变更
         state_change = {
             'time': self.env.time_system.current_step,
@@ -184,7 +196,7 @@ class StateManager:
         return True
 
     def get_state_consistency_check(self):
-        """检查状态一致性"""
+        """检查状态一致性 (Route-aware for Task B)"""
         issues = []
 
         # 检查订单与无人机状态一致性
@@ -196,21 +208,59 @@ class StateManager:
                     continue
 
                 drone = self.env.drones[drone_id]
+                planned_stops = drone.get('planned_stops', [])
 
-                # 检查状态匹配
-                if (order['status'] == OrderStatus.ASSIGNED and
-                        drone['status'] not in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]):
-                    issues.append(f"订单 {order_id} 已分配但无人机 {drone_id} 状态不匹配: {drone['status']}")
+                # Route-aware check: when drone has planned_stops, use route logic
+                if planned_stops and len(planned_stops) > 0:
+                    # For route-plan mode, check if order is in the route
+                    order_in_route = self._order_in_planned_stops(order_id, planned_stops)
+                    order_in_cargo = order_id in drone.get('cargo', set())
 
-                elif (order['status'] == OrderStatus.PICKED_UP and
-                      drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]):
-                    # 如果是批量订单，并且无人机正在飞往商家（取下一个订单），那么是允许的
-                    if not (drone['status'] == DroneStatus.FLYING_TO_MERCHANT and
-                            'batch_orders' in drone and
-                            order_id in drone['batch_orders']):
-                        issues.append(f"订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
+                    if order['status'] == OrderStatus.ASSIGNED:
+                        # ASSIGNED order should be in route or about to be picked up
+                        if not order_in_route:
+                            issues.append(f"[Route] 订单 {order_id} 已分配但不在无人机 {drone_id} 的路线中")
+
+                    elif order['status'] == OrderStatus.PICKED_UP:
+                        # PICKED_UP order consistency checks (route-aware)
+                        has_delivery_stop = self._has_delivery_stop(order_id, planned_stops)
+
+                        if len(planned_stops) > 0 and has_delivery_stop:
+                            # Drone has active route with D stop for this order
+                            if not order_in_cargo:
+                                # This is a real inconsistency - order should be in cargo
+                                issues.append(f"[Route] 订单 {order_id} 已取货但不在无人机 {drone_id} 的货物集合中")
+                        elif len(planned_stops) > 0 and order_in_cargo and not has_delivery_stop:
+                            # Order in cargo but no D stop - missing delivery stop
+                            issues.append(f"[Route] 订单 {order_id} 已取货但缺少对应的 D stop")
+                        # If planned_stops is empty or no D stop and not in cargo,
+                        # drone is likely completing/resetting - this is OK
+                else:
+                    # Legacy mode: original consistency check
+                    if (order['status'] == OrderStatus.ASSIGNED and
+                            drone['status'] not in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]):
+                        issues.append(f"订单 {order_id} 已分配但无人机 {drone_id} 状态不匹配: {drone['status']}")
+
+                    elif (order['status'] == OrderStatus.PICKED_UP and
+                          drone['status'] not in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]):
+                        # 如果是批量订单，并且无人机正在飞往商家（取下一个订单），那么是允许的
+                        if not (drone['status'] == DroneStatus.FLYING_TO_MERCHANT and
+                                'batch_orders' in drone and
+                                order_id in drone['batch_orders']):
+                            issues.append(f"订单 {order_id} 已取货但无人机 {drone_id} 状态不匹配: {drone['status']}")
 
         return issues
+
+    def _order_in_planned_stops(self, order_id, planned_stops):
+        """Check if an order appears in the planned stops (D stop)"""
+        for stop in planned_stops:
+            if stop.get('type') == 'D' and stop.get('order_id') == order_id:
+                return True
+        return False
+
+    def _has_delivery_stop(self, order_id, planned_stops):
+        """Check if a delivery stop exists for the order"""
+        return self._order_in_planned_stops(order_id, planned_stops)
 
 
 # 路径规划可视化类
@@ -969,7 +1019,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  num_bases: Optional[int] = None,
                  top_k_merchants: int = 100,
                  reward_output_mode: str = "zero",
-                 enable_random_events: bool = True,# 可选：评估时建议关掉随机事件
+                 enable_random_events: bool = True,  # 可选：评估时建议关掉随机事件
+                 debug_state_warnings: bool = False,  # Task B: control state consistency warning output
+                 delivery_sla_steps: int = 60,  # READY-based delivery SLA in steps
+                 timeout_factor: float = 1.0,  # Multiplier for deadline calculation
                  ):
         super().__init__()
 
@@ -994,6 +1047,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.objective_weights = self.fixed_objective_weights.copy()
         self.reward_output_mode = str(reward_output_mode)
         self.enable_random_events = bool(enable_random_events)
+        self.debug_state_warnings = bool(debug_state_warnings)  # Task B: debug flag
+        self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
+        self.timeout_factor = float(timeout_factor)  # Deadline multiplier
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
@@ -1206,7 +1262,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'charging_rate': random.uniform(10.0, 15.0),
                 'cancellation_rate': random.uniform(0.005, 0.015),
                 'total_distance_today': 0.0,
-                'planned_stops': deque(), # deque of stops: {'type':'P','merchant_id':mid} or {'type':'D','order_id':oid}
+                'planned_stops': deque(),
+                # deque of stops: {'type':'P','merchant_id':mid} or {'type':'D','order_id':oid}
                 'cargo': set(),  # picked-up orders (order_ids) not yet delivered
                 'current_stop': None,
                 'route_committed': False,
@@ -1244,9 +1301,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # PPO：只输出 heading
+        # PPO：输出 heading (hx, hy) + speed multiplier (u)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
+            low=-1.0, high=1.0, shape=(self.num_drones, 3), dtype=np.float32,
         )
 
     # ------------------ 时间单位统一：minutes <-> steps ------------------
@@ -1260,6 +1317,31 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         prep_steps = int(order.get('preparation_time', 1))
         sla_steps = self._minutes_to_steps(15)
         return prep_steps + sla_steps
+
+    # ------------------ READY-based deadline helpers ------------------
+
+    def _get_delivery_sla_steps(self, order: dict) -> int:
+        """Get delivery SLA in steps. Returns configured delivery_sla_steps."""
+        return self.delivery_sla_steps
+
+    def _get_delivery_deadline_step(self, order: dict) -> int:
+        """
+        Get READY-based delivery deadline step for an order.
+        Uses ready_step as start time, falls back to creation_time if not available.
+        If neither is available (unlikely), uses current_step as last resort.
+        """
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            # Fallback: use creation_time if ready_step not set yet
+            # (e.g., for orders not yet READY or old orders before this feature)
+            ready_step = order.get('creation_time')
+            if ready_step is None:
+                # Last resort: use current_step (should never happen in practice)
+                ready_step = self.time_system.current_step
+
+        delivery_sla = self._get_delivery_sla_steps(order)
+        deadline_step = ready_step + int(round(delivery_sla * self.timeout_factor))
+        return deadline_step
 
     # ------------------ Top-K merchants 观测选择 ------------------
 
@@ -1621,11 +1703,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
 
             if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
-                if order['status'] == OrderStatus.ASSIGNED:
-                    self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
-                                                           reason="sync_assigned_to_picked_up")
-                    if 'pickup_time' not in order:
-                        order['pickup_time'] = self.time_system.current_step
+                # Route-aware fix: Only auto-pickup if NOT in route-plan mode
+                # In route-plan mode, orders are picked up explicitly at P stops
+                # Note: route_committed is set to True in apply_route_plan and cleared to False
+                # in _safe_reset_drone and when drone returns to base (RETURNING_TO_BASE arrival handler)
+                if not drone.get('route_committed', False):
+                    # Legacy mode: auto-pickup when flying to customer
+                    if order['status'] == OrderStatus.ASSIGNED:
+                        self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
+                                                               reason="sync_assigned_to_picked_up")
+                        if 'pickup_time' not in order:
+                            order['pickup_time'] = self.time_system.current_step
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -1810,7 +1898,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                          drone_id: int,
                          planned_stops: List[dict],
                          commit_orders: Optional[List[int]] = None,
-                         allow_busy: bool = True) -> None:
+                         allow_busy: bool = True) -> bool:
         """
         Apply a cross-merchant interleaved route plan.
         planned_stops:
@@ -1823,13 +1911,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         Commit semantics:
             commit_orders are moved READY -> ASSIGNED and assigned to this drone.
             Orders are NOT marked PICKED_UP at commit time.
+
+        Returns:
+            bool: True if route was successfully applied, False otherwise.
         """
         if drone_id not in self.drones:
-            return
+            return False
         drone = self.drones[drone_id]
 
         if (not allow_busy) and drone['status'] != DroneStatus.IDLE:
-            return
+            return False
 
         # Derive commit_orders if not provided
         if commit_orders is None:
@@ -1860,17 +1951,48 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone['current_load'] += 1
             committed.append(oid)
 
-        if not committed:
-            return
+            # Record READY-based assignment slack for diagnostics
+            deadline_step = self._get_delivery_deadline_step(o)
+            assignment_slack = deadline_step - self.time_system.current_step
+            if 'assignment_slack_samples' not in self.metrics:
+                self.metrics['assignment_slack_samples'] = []
+            self.metrics['assignment_slack_samples'].append(assignment_slack)
 
-        # 2) Install route plan
-        drone['planned_stops'] = deque(planned_stops)
+        if not committed:
+            return False
+
+        # Task C: Validate that orders in planned_stops are in committed set
+        # and filter out D stops for non-committed orders
+        committed_set = set(committed)
+        filtered_stops = []
+        for stop in planned_stops:
+            if stop.get('type') == 'D':
+                oid = stop.get('order_id')
+                if oid is not None and oid not in committed_set:
+                    if self.debug_state_warnings:
+                        print(f"[Warning] Drone {drone_id} skipping D stop for uncommitted order {oid}")
+                    continue  # Skip this D stop
+            filtered_stops.append(stop)
+
+        # If no stops remain after filtering, don't install route
+        if not filtered_stops:
+            if self.debug_state_warnings:
+                print(f"[Warning] Drone {drone_id} route empty after filtering - no valid D stops")
+            return False
+
+        # 2) Install route plan with filtered stops
+        drone['planned_stops'] = deque(filtered_stops)
         drone['cargo'] = set()  # picked-up set starts empty
         drone['current_stop'] = None
         drone['route_committed'] = True
 
+        # Clear legacy batch state to avoid conflicts with route-plan mode
+        self._clear_drone_batch_state(drone)
+
         # 3) Start execution: set target to the first stop
         self._set_next_target_from_plan(drone_id, drone)
+
+        return True
 
     def _process_batch_assignment(self, drone_id, order_ids):
         """环境内部执行批量订单分配：给 MPSO 调用"""
@@ -1935,6 +2057,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.state_manager.update_order_status(order_id, OrderStatus.ASSIGNED, reason=f"assigned_to_drone_{drone_id}")
         order['assigned_drone'] = drone_id
         drone['current_load'] += 1
+
+        # Record READY-based assignment slack for diagnostics
+        deadline_step = self._get_delivery_deadline_step(order)
+        assignment_slack = deadline_step - self.time_system.current_step
+        if 'assignment_slack_samples' not in self.metrics:
+            self.metrics['assignment_slack_samples'] = []
+        self.metrics['assignment_slack_samples'].append(assignment_slack)
 
         target_merchant_loc = order['merchant_location']
 
@@ -2018,11 +2147,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self._handle_random_events()
         self._update_air_traffic()
 
-        consistency_issues = self.state_manager.get_state_consistency_check()
-        if consistency_issues:
-            print("状态一致性警告:")
-            for issue in consistency_issues:
-                print(f"  - {issue}")
+        # Task B: Only print warnings if debug flag is enabled
+        if self.debug_state_warnings:
+            consistency_issues = self.state_manager.get_state_consistency_check()
+            if consistency_issues:
+                print("状态一致性警告:")
+                for issue in consistency_issues:
+                    print(f"  - {issue}")
+        else:
+            # Silently check and count issues but don't spam output
+            consistency_issues = self.state_manager.get_state_consistency_check()
+            if consistency_issues and self.time_system.current_step % 64 == 0:
+                # Periodic summary: print count every 64 steps (4 hours at 4 steps/hour)
+                print(f"[Step {self.time_system.current_step}] 状态一致性问题计数: {len(consistency_issues)}")
 
     def _update_merchant_preparation(self):
         for merchant_id, merchant in self.merchants.items():
@@ -2051,7 +2188,47 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order_id in merchant['queue']:
                     merchant['queue'].remove(order_id)
 
+    def _sync_drone_status_with_route(self):
+        """
+        Synchronize drone status with route plan (Task A).
+        Called at the start of each step to ensure drone status matches planned_stops.
+        """
+        for drone_id, drone in self.drones.items():
+            planned_stops = drone.get('planned_stops')
+            if not planned_stops or len(planned_stops) == 0:
+                # No planned stops - allow IDLE or RETURNING
+                continue
+
+            # Get first stop
+            stop = planned_stops[0]
+            stop_type = stop.get('type')
+
+            if stop_type == 'P':
+                # Pickup stop - should be FLYING_TO_MERCHANT
+                expected_status = DroneStatus.FLYING_TO_MERCHANT
+                loc = self._stop_to_location(stop)
+                if loc and drone['status'] != expected_status:
+                    self.state_manager.update_drone_status(drone_id, expected_status, target_location=loc)
+                    drone['current_merchant_id'] = stop.get('merchant_id')
+                # Ensure target_location matches stop location
+                if loc and drone.get('target_location') != loc:
+                    drone['target_location'] = loc
+
+            elif stop_type == 'D':
+                # Delivery stop - should be FLYING_TO_CUSTOMER
+                expected_status = DroneStatus.FLYING_TO_CUSTOMER
+                loc = self._stop_to_location(stop)
+                if loc and drone['status'] != expected_status:
+                    self.state_manager.update_drone_status(drone_id, expected_status, target_location=loc)
+                    drone['current_order_id'] = stop.get('order_id')
+                # Ensure target_location matches stop location
+                if loc and drone.get('target_location') != loc:
+                    drone['target_location'] = loc
+
     def _update_drone_positions(self):
+        # Sync drone status with route plan at the start of position update
+        self._sync_drone_status_with_route()
+
         headings = getattr(self, "_last_route_heading", None)
 
         for drone_id, drone in self.drones.items():
@@ -2090,9 +2267,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     continue
 
                 if headings is None:
-                    ppo_hx, ppo_hy = 0.0, 0.0
+                    ppo_hx, ppo_hy, ppo_u = 0.0, 0.0, 1.0
                 else:
-                    ppo_hx, ppo_hy = headings[int(drone_id)]
+                    # Extract (hx, hy, u) from action - u is speed multiplier
+                    action_vec = headings[int(drone_id)]
+                    ppo_hx, ppo_hy = action_vec[0], action_vec[1]
+                    ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
+
+                    # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
+                    # Using standard linear interpolation:
+                    #   normalized = (value - old_min) / (old_max - old_min)
+                    #   result = normalized * (new_max - new_min) + new_min
+                    # Here: old_range=[-1,1], new_range=[0.5,1.5]
+                    normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
+                    ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
+                    ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
 
                 ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
                 if ppo_norm > 1e-6:
@@ -2114,7 +2303,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 else:
                     move_hx, move_hy = tgt_hx, tgt_hy
 
-                step_len = min(speed, dist_to_target)
+                # Apply speed multiplier from PPO action
+                step_len = min(speed * ppo_u, dist_to_target)
                 nx = float(np.clip(cx + move_hx * step_len, 0, self.grid_size - 1))
                 ny = float(np.clip(cy + move_hy * step_len, 0, self.grid_size - 1))
 
@@ -2179,13 +2369,33 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         Pop invalid stops until a valid target is found; then set drone target/status.
         If no stop remains, reset/return-to-base.
+        Task C: Add validation for stop/order consistency.
         """
         while drone.get('planned_stops') and len(drone['planned_stops']) > 0:
             stop = drone['planned_stops'][0]
             loc = self._stop_to_location(stop)
             if loc is None:
+                if self.debug_state_warnings:
+                    print(f"[Drone {drone_id}] 无效 stop (location not found): {stop}")
                 drone['planned_stops'].popleft()
                 continue
+
+            # Task C: Validate D stops reference valid orders
+            if stop.get('type') == 'D':
+                oid = stop.get('order_id')
+                if oid is not None and oid in self.orders:
+                    o = self.orders[oid]
+                    # Check if order is valid for delivery
+                    if o.get('assigned_drone') != drone_id:
+                        if self.debug_state_warnings:
+                            print(f"[Drone {drone_id}] D stop {oid} 不属于该无人机，跳过")
+                        drone['planned_stops'].popleft()
+                        continue
+                    if o['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
+                        if self.debug_state_warnings:
+                            print(f"[Drone {drone_id}] D stop {oid} 订单已取消或已送达，跳过")
+                        drone['planned_stops'].popleft()
+                        continue
 
             drone['current_stop'] = stop
             self._start_new_task(drone_id, drone, loc)
@@ -2464,8 +2674,22 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        promised_steps = self._get_promised_delivery_steps(order)
-        if delivery_duration <= promised_steps:
+        # Use READY-based SLA for on-time calculation and lateness tracking
+        # Note: Lateness uses pure SLA (not timeout_factor), as timeout is for cancellation only
+        # Lateness = delivery_time - (ready_step + sla_steps)
+        # Use ready_step with creation_time as fallback if ready_step wasn't set
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+
+        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+
+        # Record lateness for diagnostics
+        if 'ready_based_lateness_samples' not in self.metrics:
+            self.metrics['ready_based_lateness_samples'] = []
+        self.metrics['ready_based_lateness_samples'].append(delivery_lateness)
+
+        if delivery_lateness <= 0:
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
 
@@ -2829,6 +3053,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         stale_threshold = 50
 
         for order_id, order in list(self.orders.items()):
+            # Check for READY-based timeout cancellation
+            if order['status'] in [OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]:
+                deadline_step = self._get_delivery_deadline_step(order)
+                if current_step > deadline_step:
+                    self._cancel_order(order_id, "ready_based_timeout")
+                    continue
+
             if order['status'] == OrderStatus.ASSIGNED:
                 drone_id = order.get('assigned_drone', -1)
 
@@ -3119,3 +3350,93 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 status_count['charging'] += 1
 
         return status_count
+
+    # ------------------ Snapshot interfaces for MOPSO ------------------
+
+    def get_ready_orders_snapshot(self, limit: int = 200) -> List[dict]:
+        """
+        Get snapshot of READY orders for MOPSO scheduling.
+        Returns list of order dicts with essential fields.
+        """
+        ready_orders = []
+        for oid in self.active_orders:
+            if oid not in self.orders:
+                continue
+            order = self.orders[oid]
+            if order['status'] != OrderStatus.READY:
+                continue
+            if order.get('assigned_drone', -1) not in (-1, None):
+                continue
+
+            # Create snapshot with essential fields
+            snapshot = {
+                'order_id': oid,
+                'merchant_id': order['merchant_id'],
+                'merchant_location': order['merchant_location'],
+                'customer_location': order['customer_location'],
+                'creation_time': order['creation_time'],
+                'deadline_step': self._get_delivery_deadline_step(order),
+                'urgent': order.get('urgent', False),
+                'distance': order.get('distance', 0.0),
+            }
+            ready_orders.append(snapshot)
+
+            if len(ready_orders) >= limit:
+                break
+
+        return ready_orders
+
+    def get_drones_snapshot(self) -> List[dict]:
+        """
+        Get snapshot of all drones for MOPSO scheduling.
+        Returns list of drone dicts with essential fields.
+        """
+        drones_snapshot = []
+        for drone_id, drone in self.drones.items():
+            snapshot = {
+                'drone_id': drone_id,
+                'location': drone['location'],
+                'base': drone['base'],
+                'status': drone['status'],
+                'battery_level': drone['battery_level'],
+                'current_load': drone['current_load'],
+                'max_capacity': drone['max_capacity'],
+                'speed': drone['speed'],
+                'battery_consumption_rate': drone['battery_consumption_rate'],
+                'has_route': drone.get('route_committed', False),
+            }
+            drones_snapshot.append(snapshot)
+
+        return drones_snapshot
+
+    def get_merchants_snapshot(self) -> Dict[str, dict]:
+        """
+        Get snapshot of all merchants for MOPSO scheduling.
+        Returns dict mapping merchant_id to merchant info.
+        """
+        merchants_snapshot = {}
+        for merchant_id, merchant in self.merchants.items():
+            snapshot = {
+                'merchant_id': merchant_id,
+                'location': merchant['location'],
+                'queue_length': len(merchant.get('queue', [])),
+                'cancellation_rate': merchant.get('cancellation_rate', 0.01),
+                'landing_zone': merchant.get('landing_zone', True),
+            }
+            merchants_snapshot[merchant_id] = snapshot
+
+        return merchants_snapshot
+
+    def get_route_plan_constraints(self) -> dict:
+        """
+        Get constraints for route plan generation.
+        Returns dict with constraint parameters.
+        """
+        constraints = {
+            'grid_size': self.grid_size,
+            'current_step': self.time_system.current_step,
+            'max_capacity_per_drone': self.drone_max_capacity,
+            'weather_speed_factor': self._get_weather_speed_factor(),
+            'weather_battery_factor': self._get_weather_battery_factor(),
+        }
+        return constraints
