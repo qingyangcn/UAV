@@ -30,11 +30,13 @@ class MOPSOPlanner:
     """
     Multi-Objective PSO for UAV delivery scheduling.
 
-    Generates route plans for idle drones using MOPSO with:
+    Generates route plans for drones with remaining capacity using MOPSO with:
     - Random Keys encoding for order assignment
     - Cross-merchant interleaved stop construction
     - Multi-objective fitness evaluation
     - Pareto archive maintenance
+    
+    Can dispatch to both idle drones and busy drones with remaining capacity.
     """
 
     def __init__(self,
@@ -119,21 +121,23 @@ class MOPSOPlanner:
         if objective_weights is None:
             objective_weights = getattr(env, 'objective_weights', np.array([0.33, 0.33, 0.34]))
 
-        # Filter idle drones without route
-        idle_drones = [d for d in drones
-                      if d['status'].name == 'IDLE' and not d.get('has_route', False)]
+        # Filter drones with remaining capacity
+        # Use can_accept_more if available, otherwise check current_load < max_capacity
+        # Note: max_capacity should always be positive; default to 1 as safeguard
+        eligible_drones = [d for d in drones
+                          if d.get('can_accept_more', d.get('current_load', 0) < max(d.get('max_capacity', 1), 1))]
 
-        if not idle_drones or not ready_orders:
+        if not eligible_drones or not ready_orders:
             return {}
 
         # Limit orders to max_orders
         ready_orders = ready_orders[:self.max_orders]
 
-        # Run MOPSO
-        best_assignment = self._run_mopso(ready_orders, idle_drones, merchants, constraints, objective_weights)
+        # Run MOPSO on all eligible drones
+        best_assignment = self._run_mopso(ready_orders, eligible_drones, merchants, constraints, objective_weights)
 
         # Convert assignment to route plans
-        plans = self._assignment_to_route_plans(best_assignment, ready_orders, idle_drones, merchants, constraints)
+        plans = self._assignment_to_route_plans(best_assignment, ready_orders, eligible_drones, merchants, constraints)
 
         return plans
 
@@ -144,7 +148,7 @@ class MOPSOPlanner:
 
         Args:
             orders: List of order snapshots
-            drones: List of idle drone snapshots
+            drones: List of eligible drone snapshots (with remaining capacity)
             merchants: Merchant data
             constraints: Environment constraints
             weights: Objective weights for final selection
@@ -520,12 +524,28 @@ def apply_mopso_dispatch(env, planner: Optional[MOPSOPlanner] = None, **kwargs):
 
     plans = planner.mopso_dispatch(env)
 
+    # Get drone snapshots to check has_route status
+    drones_snapshot = env.get_drones_snapshot()
+    drone_has_route = {d['drone_id']: d.get('has_route', False) for d in drones_snapshot}
+
     # Apply plans to environment (Task D: handle return value)
     applied_count = 0
     failed_count = 0
     for drone_id, (planned_stops, commit_orders) in plans.items():
         try:
-            success = env.apply_route_plan(drone_id, planned_stops, commit_orders, allow_busy=False)
+            # Check if drone has existing route
+            has_route = drone_has_route.get(drone_id, False)
+            
+            # For backward compatibility, check if append_route_plan exists
+            has_append_method = hasattr(env, 'append_route_plan')
+            
+            if has_route and has_append_method:
+                # Drone has existing route - append to it
+                success = env.append_route_plan(drone_id, planned_stops, commit_orders)
+            else:
+                # Drone has no route or env doesn't support append - use apply with allow_busy
+                success = env.apply_route_plan(drone_id, planned_stops, commit_orders, allow_busy=True)
+            
             if success:
                 applied_count += 1
             else:
