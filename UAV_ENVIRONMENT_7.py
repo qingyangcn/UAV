@@ -1023,6 +1023,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
                  delivery_sla_steps: int = 60,  # READY-based delivery SLA in steps
                  timeout_factor: float = 1.0,  # Multiplier for deadline calculation
+                 # ===== U7: Task selection parameters =====
+                 num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
                  ):
         super().__init__()
 
@@ -1039,6 +1041,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.pending_distance_reward = 0.0
 
         self.top_k_merchants = int(top_k_merchants)
+
+        # ========== U7: Task selection parameters ==========
+        self.num_candidates = int(num_candidates)  # K=20 candidates per drone
+        # Store candidate mappings per drone: {drone_id: [(order_id, is_valid), ...]}
+        self.drone_candidate_mappings = {}
 
         # ========== 多目标训练方式 ==========
         self.multi_objective_mode = multi_objective_mode
@@ -1290,6 +1297,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # 固定 num_bases
             'bases': spaces.Box(low=0, high=1, shape=(self.obs_num_bases, 3), dtype=np.float32),
 
+            # U7: Candidate orders per drone (K=20, F=12 features)
+            'candidates': spaces.Box(low=0, high=1, shape=(self.num_drones, self.num_candidates, 12), dtype=np.float32),
+
             'weather': spaces.Discrete(len(WeatherType)),
             'weather_details': spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32),
             'time': spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32),
@@ -1301,9 +1311,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # PPO：输出 heading (hx, hy) + speed multiplier (u)
+        # U7: PPO outputs task choice (discrete 0-K-1) + speed multiplier (u)
+        # Action shape: (num_drones, 2) where [:, 0] is choice in [-1, 1] -> discretized, [:, 1] is speed
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_drones, 3), dtype=np.float32,
+            low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
         )
 
     # ------------------ 时间单位统一：minutes <-> steps ------------------
@@ -1361,6 +1372,111 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         return top_ids
 
+    # ------------------ U7: Candidate order selection for task selection ------------------
+
+    def _build_candidate_list_for_drone(self, drone_id: int) -> List[Tuple[int, bool]]:
+        """
+        Build candidate list for a drone for PPO task selection.
+        Returns list of (order_id, is_valid) tuples of length num_candidates (K=20).
+        
+        Priority:
+        1. Orders in drone cargo (PICKED_UP) assigned to this drone
+        2. Orders ASSIGNED to this drone but not yet picked up
+        3. Padding with (-1, False) for invalid slots
+        
+        Returns:
+            List of (order_id, is_valid) tuples, always length K
+        """
+        drone = self.drones[drone_id]
+        candidates = []
+        
+        # 1. Orders already in cargo (PICKED_UP)
+        cargo_orders = list(drone.get('cargo', set()))
+        for oid in cargo_orders:
+            if oid in self.orders:
+                order = self.orders[oid]
+                if order['status'] == OrderStatus.PICKED_UP:
+                    candidates.append((oid, True))
+        
+        # 2. Orders assigned but not picked up
+        for oid in self.active_orders:
+            if len(candidates) >= self.num_candidates:
+                break
+            order = self.orders.get(oid)
+            if order and order.get('assigned_drone') == drone_id:
+                if order['status'] == OrderStatus.ASSIGNED and oid not in cargo_orders:
+                    candidates.append((oid, True))
+        
+        # 3. Pad with invalid entries
+        while len(candidates) < self.num_candidates:
+            candidates.append((-1, False))
+        
+        # Ensure exactly K candidates
+        return candidates[:self.num_candidates]
+
+    def _encode_candidate(self, order_id: int, is_valid: bool) -> np.ndarray:
+        """
+        Encode a candidate order into features (12-dimensional).
+        Features:
+        0: validity (1.0 if valid, 0.0 if padding)
+        1-5: order status one-hot (5 relevant statuses)
+        6: order type (0-1 normalized)
+        7: age (normalized by 50 steps)
+        8: urgency (1.0 if urgent, 0.0 otherwise)
+        9: deadline slack (normalized, 1.0=no urgency, 0.0=overdue)
+        10: merchant location x (normalized)
+        11: customer location y (normalized)
+        """
+        encoding = np.zeros(12, dtype=np.float32)
+        
+        if not is_valid or order_id < 0:
+            return encoding  # All zeros for invalid
+        
+        if order_id not in self.orders:
+            return encoding
+        
+        order = self.orders[order_id]
+        
+        # Feature 0: validity
+        encoding[0] = 1.0
+        
+        # Features 1-5: status one-hot (ASSIGNED=4, PICKED_UP=5 are most relevant)
+        status_val = order['status'].value
+        if status_val < 5:
+            encoding[1 + status_val] = 1.0
+        
+        # Feature 6: order type
+        encoding[6] = order['order_type'].value / 2.0
+        
+        # Feature 7: age
+        age = self.time_system.current_step - order['creation_time']
+        encoding[7] = min(age / 50.0, 1.0)
+        
+        # Feature 8: urgency
+        encoding[8] = 1.0 if order.get('urgent', False) else 0.0
+        
+        # Feature 9: deadline slack
+        deadline_step = self._get_delivery_deadline_step(order)
+        current_step = self.time_system.current_step
+        slack = deadline_step - current_step
+        # Normalize: positive slack = good (1.0), negative = overdue (0.0)
+        encoding[9] = np.clip(slack / 50.0 + 0.5, 0.0, 1.0)
+        
+        # Features 10-11: merchant location (for pickup)
+        merchant_id = order.get('merchant_id')
+        if merchant_id and merchant_id in self.merchants:
+            merchant = self.merchants[merchant_id]
+            mloc = merchant['location']
+            encoding[10] = mloc[0] / self.grid_size
+            encoding[11] = mloc[1] / self.grid_size
+        
+        return encoding
+
+    def _update_candidate_mappings(self):
+        """Update candidate mappings for all drones. Called each step."""
+        for drone_id in range(self.num_drones):
+            self.drone_candidate_mappings[drone_id] = self._build_candidate_list_for_drone(drone_id)
+
     # ------------------ reset / step ------------------
 
     def reset(self, seed=None, options=None):
@@ -1412,6 +1528,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         for d in range(self.num_drones):
             self._prev_target_dist[d] = self._get_dist_to_target(d)
         self.episode_r_vec[:] = 0.0
+        
+        # U7: Initialize candidate mappings
+        self._update_candidate_mappings()
+        
         obs = self._get_observation()
         obs['objective_weights'] = self.objective_weights.copy()
         info = self._get_info()
@@ -1434,10 +1554,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if time_state['minute'] == 0:
             self._update_weather_from_dataset()
 
+        # U7: Update candidate mappings before processing action
+        self._update_candidate_mappings()
+
         # 处理动作（heading 不直接给奖励，奖励来自系统指标+shaping）
         r_vec = self._process_action(action)
 
-        # dense shaping
+        # dense shaping (no longer uses heading since we removed it)
         shaping_vec = self._calculate_shaping_reward(action)
         r_vec = r_vec + shaping_vec
         self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
@@ -1779,9 +1902,108 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     # ------------------ rewards ------------------
 
+    def _is_at_decision_point(self, drone_id: int) -> bool:
+        """
+        Check if drone is at a decision point where PPO can change target.
+        Decision points: IDLE, just arrived at merchant (after pickup), just arrived at customer (after delivery).
+        """
+        drone = self.drones[drone_id]
+        status = drone['status']
+        
+        # Always a decision point when IDLE
+        if status == DroneStatus.IDLE:
+            return True
+        
+        # Decision point if we just completed a pickup or delivery
+        # This is checked when drone status transitions happen, but for simplicity,
+        # we'll check if drone has arrived at target (distance < threshold)
+        if 'target_location' not in drone:
+            return False
+        
+        dist_to_target = self._get_dist_to_target(drone_id)
+        
+        # If very close to target and in appropriate status
+        if dist_to_target < 0.15:
+            if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
+                # At merchant - decision point after pickup
+                return True
+            elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
+                # At customer - decision point after delivery
+                return True
+        
+        return False
+
     def _process_action(self, action):
-        """heading action 不直接给即时奖励；奖励来自系统指标+shaping"""
+        """
+        U7: Process action containing task choice + speed control.
+        Action shape: (num_drones, 2) where:
+          action[d, 0]: task choice in [-1, 1] -> discretized to [0, K-1]
+          action[d, 1]: speed multiplier in [-1, 1] -> mapped to [0.5, 1.5]
+        """
         self._last_route_heading = action
+        
+        # Process each drone's action
+        for drone_id in range(self.num_drones):
+            drone = self.drones[drone_id]
+            
+            # Extract action components
+            choice_raw = float(action[drone_id, 0])
+            speed_raw = float(action[drone_id, 1])
+            
+            # Map speed: [-1, 1] -> [0.5, 1.5]
+            speed_multiplier = (speed_raw + 1.0) / 2.0 * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
+            speed_multiplier = np.clip(speed_multiplier, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
+            
+            # Store speed multiplier (used in movement)
+            drone['ppo_speed_multiplier'] = float(speed_multiplier)
+            
+            # Only process task choice at decision points
+            if not self._is_at_decision_point(drone_id):
+                continue
+            
+            # Map choice: [-1, 1] -> [0, K-1]
+            choice_idx = int(np.floor((choice_raw + 1.0) / 2.0 * self.num_candidates))
+            choice_idx = np.clip(choice_idx, 0, self.num_candidates - 1)
+            
+            # Get candidate mapping
+            if drone_id not in self.drone_candidate_mappings:
+                continue
+            
+            candidate_list = self.drone_candidate_mappings[drone_id]
+            if choice_idx >= len(candidate_list):
+                continue
+            
+            order_id, is_valid = candidate_list[choice_idx]
+            
+            # If invalid or no order, skip
+            if not is_valid or order_id < 0 or order_id not in self.orders:
+                continue
+            
+            order = self.orders[order_id]
+            
+            # Determine target based on order status
+            if order['status'] == OrderStatus.PICKED_UP:
+                # Order in cargo -> deliver to customer
+                customer_id = order.get('customer_id')
+                if customer_id:
+                    customer_loc = self.location_loader.get_user_grid_location(customer_id)
+                    if customer_loc:
+                        drone['target_location'] = customer_loc
+                        self.state_manager.update_drone_status(
+                            drone_id, DroneStatus.FLYING_TO_CUSTOMER, target_location=customer_loc
+                        )
+            elif order['status'] == OrderStatus.ASSIGNED:
+                # Order assigned but not picked up -> go to merchant
+                merchant_id = order.get('merchant_id')
+                if merchant_id and merchant_id in self.merchants:
+                    merchant_loc = self.merchants[merchant_id]['location']
+                    drone['target_location'] = merchant_loc
+                    drone['current_merchant_id'] = merchant_id
+                    self.state_manager.update_drone_status(
+                        drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
+                    )
+        
+        # Calculate rewards based on system metrics
         r_vec = self._calculate_three_objective_rewards()
         return r_vec
 
@@ -2225,7 +2447,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     if distance > 0.1:
                         dx = target_loc[0] - current_loc[0]
                         dy = target_loc[1] - current_loc[1]
-                        move_distance = min(distance, 0.3)
+                        
+                        # U7: Apply PPO speed multiplier if available
+                        base_move_distance = 0.3
+                        speed_mult = drone.get('ppo_speed_multiplier', 1.0)
+                        move_distance = min(distance, base_move_distance * speed_mult)
 
                         if distance > 0:
                             new_x = current_loc[0] + (dx / distance) * move_distance
@@ -3299,11 +3525,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         base_obs = np.clip(base_obs, 0.0, 1.0).astype(np.float32)
         air_traffic = np.clip(self.air_traffic, 0.0, 1.0).astype(np.float32)
 
+        # U7: Build candidate observations
+        candidates_obs = np.zeros((self.num_drones, self.num_candidates, 12), dtype=np.float32)
+        for drone_id in range(self.num_drones):
+            if drone_id not in self.drone_candidate_mappings:
+                # No candidates yet, use empty
+                continue
+            candidate_list = self.drone_candidate_mappings[drone_id]
+            for i, (order_id, is_valid) in enumerate(candidate_list):
+                candidates_obs[drone_id, i] = self._encode_candidate(order_id, is_valid)
+        candidates_obs = np.clip(candidates_obs, 0.0, 1.0).astype(np.float32)
+
         return {
             'orders': order_obs,
             'drones': drone_obs,
             'merchants': merchant_obs,
             'bases': base_obs,
+            'candidates': candidates_obs,
             'weather': int(self.weather.value),
             'weather_details': weather_details,
             'time': time_obs,
