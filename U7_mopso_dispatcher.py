@@ -15,6 +15,12 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 
 from U6_mopso_dispatcher import MOPSOPlanner
+# Import OrderStatus from environment for proper enum usage
+try:
+    from UAV_ENVIRONMENT_7 import OrderStatus
+except ImportError:
+    # Fallback if import fails
+    OrderStatus = None
 
 
 class U7MOPSOAssigner:
@@ -160,9 +166,13 @@ def apply_mopso_assignment(env, assigner: Optional[U7MOPSOAssigner] = None, **kw
             if not order:
                 continue
             
-            # Only assign READY orders
-            if order['status'].name != 'READY':
-                continue
+            # Only assign READY orders - use proper enum comparison if available
+            if OrderStatus is not None:
+                if order['status'] != OrderStatus.READY:
+                    continue
+            else:
+                if order['status'].name != 'READY':
+                    continue
             
             # Check if already assigned
             if order.get('assigned_drone') not in (None, -1):
@@ -176,13 +186,16 @@ def apply_mopso_assignment(env, assigner: Optional[U7MOPSOAssigner] = None, **kw
                     assigned_count += 1
                 except Exception:
                     # Fallback to manual assignment
-                    env.state_manager.update_order_status(order_id, env.OrderStatus.ASSIGNED)
+                    # Use imported OrderStatus if available, otherwise get from env
+                    assigned_status = OrderStatus.ASSIGNED if OrderStatus else env.OrderStatus.ASSIGNED
+                    env.state_manager.update_order_status(order_id, assigned_status)
                     order['assigned_drone'] = drone_id
                     drone['current_load'] += 1
                     assigned_count += 1
             else:
                 # Manual assignment
-                env.state_manager.update_order_status(order_id, env.OrderStatus.ASSIGNED)
+                assigned_status = OrderStatus.ASSIGNED if OrderStatus else env.OrderStatus.ASSIGNED
+                env.state_manager.update_order_status(order_id, assigned_status)
                 order['assigned_drone'] = drone_id
                 drone['current_load'] += 1
                 assigned_count += 1

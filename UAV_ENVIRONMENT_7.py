@@ -1311,8 +1311,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # U7: PPO outputs task choice (discrete 0-K-1) + speed multiplier (u)
-        # Action shape: (num_drones, 2) where [:, 0] is choice in [-1, 1] -> discretized, [:, 1] is speed
+        # U7: PPO outputs task choice (continuous [-1, 1] mapped to discrete [0, K-1]) + speed multiplier
+        # Action shape: (num_drones, 2) where:
+        #   [:, 0] is choice in [-1, 1] (continuous) -> internally discretized to [0, K-1]
+        #   [:, 1] is speed in [-1, 1] (continuous) -> mapped to [0.5, 1.5]
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
         )
@@ -1962,8 +1964,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 continue
             
             # Map choice: [-1, 1] -> [0, K-1]
-            choice_idx = int(np.floor((choice_raw + 1.0) / 2.0 * self.num_candidates))
-            choice_idx = np.clip(choice_idx, 0, self.num_candidates - 1)
+            # Using min to handle edge case where choice_raw = 1.0 would give K
+            choice_idx = min(
+                int(np.floor((choice_raw + 1.0) / 2.0 * self.num_candidates)),
+                self.num_candidates - 1
+            )
             
             # Get candidate mapping
             if drone_id not in self.drone_candidate_mappings:
