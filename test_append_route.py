@@ -148,16 +148,16 @@ def test_append_route_plan():
     
     print(f"Drone {drone_id} current_load after append: {drone['current_load']}")
     print(f"Drone {drone_id} planned_stops count: before={stops_before}, after={len(drone['planned_stops'])}")
-    print(f"Cargo preserved: {cargo_before == drone['cargo'] or cargo_before.issubset(drone['cargo'])}")
+    print(f"Cargo preserved: {cargo_before.issubset(drone['cargo'])}")
     
     # Verify that stops were appended, not replaced
     if len(drone['planned_stops']) <= stops_before:
         print("❌ Test failed: Stops were not appended (route was replaced or cleared)")
         return False
     
-    # Verify that cargo was not reset
+    # Verify that cargo was preserved (existing cargo should still be there)
     if not cargo_before.issubset(drone['cargo']):
-        print("❌ Test failed: Cargo was reset instead of preserved")
+        print("❌ Test failed: Cargo was not preserved (existing cargo was lost)")
         return False
     
     print("\n" + "=" * 60)
