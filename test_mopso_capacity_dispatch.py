@@ -211,10 +211,8 @@ def test_append_vs_apply_logic():
     if total_plans > 0:
         # At least verify the dispatching logic
         has_route_drones = {d_id for d_id, d in env.drones.items() if d.get('has_route', False)}
-        no_route_drones = {d_id for d_id, d in env.drones.items() if not d.get('has_route', False)}
         
         appended_drone_ids = {p['drone_id'] for p in env.appended_plans}
-        applied_drone_ids = {p['drone_id'] for p in env.applied_plans}
         
         # All appended plans should be for drones with routes
         if appended_drone_ids:
@@ -223,8 +221,8 @@ def test_append_vs_apply_logic():
             print(f"✓ All {len(appended_drone_ids)} appended plans went to drones with existing routes")
         
         # Applied plans can be for any drone (but should use allow_busy=True)
-        if applied_drone_ids:
-            print(f"✓ All {len(applied_drone_ids)} applied plans used correct allow_busy flag")
+        if len(env.applied_plans) > 0:
+            print(f"✓ All {len(env.applied_plans)} applied plans used correct allow_busy flag")
     else:
         print("⚠ No plans generated (this is ok, but check order/drone setup)")
 

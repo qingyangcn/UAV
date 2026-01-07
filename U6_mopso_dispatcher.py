@@ -123,8 +123,9 @@ class MOPSOPlanner:
 
         # Filter drones with remaining capacity
         # Use can_accept_more if available, otherwise check current_load < max_capacity
+        # Note: max_capacity should always be positive; default to 1 as safeguard
         eligible_drones = [d for d in drones
-                          if d.get('can_accept_more', d.get('current_load', 0) < d.get('max_capacity', 1))]
+                          if d.get('can_accept_more', d.get('current_load', 0) < max(d.get('max_capacity', 1), 1))]
 
         if not eligible_drones or not ready_orders:
             return {}
