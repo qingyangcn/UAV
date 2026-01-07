@@ -2084,14 +2084,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             return False
         
         # 2) Append stops to existing route (don't replace!)
-        # Track original stops count to determine if we should start execution
-        original_stops_count = 0
+        # Track count of stops before appending to determine if we should start execution
+        existing_stops_count = 0
         
         # Initialize planned_stops if it doesn't exist
         if 'planned_stops' not in drone or drone['planned_stops'] is None:
             drone['planned_stops'] = deque()
         else:
-            original_stops_count = len(drone['planned_stops'])
+            existing_stops_count = len(drone['planned_stops'])
         
         # Append new stops to the end of existing route
         for stop in filtered_stops:
@@ -2104,11 +2104,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Mark route as committed
         drone['route_committed'] = True
         
-        # 3) Start execution only if drone has no current route
+        # 3) Start execution only if this is the first route assignment
         # If drone already has planned_stops and is executing, don't interrupt
-        # Only set next target if drone is idle or had no stops before
-        if drone['status'] == DroneStatus.IDLE or original_stops_count == 0:
-            # Drone was idle or we just added the first stops
+        # Only set next target if drone is idle or had no stops before appending
+        if drone['status'] == DroneStatus.IDLE or existing_stops_count == 0:
+            # Drone was idle or we just added the first stops - start execution
             self._set_next_target_from_plan(drone_id, drone)
         
         return True

@@ -24,7 +24,8 @@ def validate_requirements():
     
     env.reset()
     
-    # Generate orders
+    # Generate orders - using 15 steps to ensure sufficient READY orders
+    # Typically 2-4 orders are generated per step depending on probability
     for _ in range(15):
         env.step(np.zeros((env.num_drones, 3)))
     

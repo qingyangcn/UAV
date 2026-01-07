@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 Test script to validate append_route_plan functionality.
+
 This test demonstrates that drones with remaining capacity can accept additional orders
 without interrupting their current route execution.
+
+Test Scenarios:
+1. Verify get_drones_snapshot includes 'can_accept_more' field
+2. Test apply_route_plan for idle drones (existing behavior)
+3. Test append_route_plan for busy drones (new functionality)
+4. Validate cargo and planned stops preservation during append
+5. Confirm drones with capacity can accept additional orders
 """
 
 import sys
