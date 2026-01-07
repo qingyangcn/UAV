@@ -14,7 +14,11 @@ import math
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 
+# NOTE: This module depends on U6_mopso_dispatcher for the core MOPSO optimization logic.
+# We reuse MOPSOPlanner's _run_mopso method to avoid code duplication while changing
+# only the assignment application (no route planning in U7).
 from U6_mopso_dispatcher import MOPSOPlanner
+
 # Import OrderStatus from environment for proper enum usage
 try:
     from UAV_ENVIRONMENT_7 import OrderStatus
@@ -184,8 +188,12 @@ def apply_mopso_assignment(env, assigner: Optional[U7MOPSOAssigner] = None, **kw
                 try:
                     env._process_single_assignment(drone_id, order_id, allow_busy=True)
                     assigned_count += 1
-                except Exception:
-                    # Fallback to manual assignment
+                except Exception as e:
+                    # Fallback to manual assignment if _process_single_assignment fails
+                    # This can happen if the environment state is inconsistent
+                    import warnings
+                    warnings.warn(f"Failed to use _process_single_assignment for order {order_id}: {e}. "
+                                 f"Falling back to manual assignment.")
                     # Use imported OrderStatus if available, otherwise get from env
                     assigned_status = OrderStatus.ASSIGNED if OrderStatus else env.OrderStatus.ASSIGNED
                     env.state_manager.update_order_status(order_id, assigned_status)
