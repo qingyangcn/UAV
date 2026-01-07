@@ -1994,6 +1994,120 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         return True
 
+    def append_route_plan(self,
+                          drone_id: int,
+                          planned_stops: List[dict],
+                          commit_orders: Optional[List[int]] = None) -> bool:
+        """
+        Append additional stops to a drone's existing route plan without interrupting current execution.
+        
+        This method allows assigning additional orders to drones that have remaining capacity
+        but are currently busy executing a route. Unlike apply_route_plan which replaces
+        the entire route, this method safely extends the existing route.
+        
+        Args:
+            drone_id: ID of the drone to extend
+            planned_stops: List of stops to append [{'type':'P','merchant_id':mid}, {'type':'D','order_id':oid}, ...]
+            commit_orders: Optional list of order IDs to commit (if None, derived from planned_stops)
+            
+        Returns:
+            bool: True if route was successfully extended, False otherwise
+            
+        Constraints:
+            - Only READY orders can be committed
+            - Drone must have remaining capacity (current_load < max_capacity)
+            - Does not reset existing cargo or planned_stops
+            - Does not interrupt current target if drone is already executing a route
+        """
+        if drone_id not in self.drones:
+            return False
+        drone = self.drones[drone_id]
+        
+        # Check if drone has remaining capacity
+        if drone['current_load'] >= drone['max_capacity']:
+            return False
+        
+        # Derive commit_orders if not provided
+        if commit_orders is None:
+            commit_orders = []
+            for st in planned_stops:
+                if st.get('type') == 'D' and 'order_id' in st:
+                    commit_orders.append(int(st['order_id']))
+            # unique, keep order
+            commit_orders = list(dict.fromkeys(commit_orders))
+        
+        # 1) Commit orders: only READY orders are allowed
+        committed = []
+        for oid in commit_orders:
+            o = self.orders.get(oid)
+            if o is None:
+                continue
+            
+            # Only READY can be in planned_stops/commit list
+            if o['status'] != OrderStatus.READY:
+                continue
+            if o.get('assigned_drone', -1) not in (-1, None):
+                continue
+            if drone['current_load'] >= drone['max_capacity']:
+                break
+            
+            self.state_manager.update_order_status(oid, OrderStatus.ASSIGNED, reason=f"route_append_{drone_id}")
+            o['assigned_drone'] = drone_id
+            drone['current_load'] += 1
+            committed.append(oid)
+            
+            # Record READY-based assignment slack for diagnostics
+            deadline_step = self._get_delivery_deadline_step(o)
+            assignment_slack = deadline_step - self.time_system.current_step
+            if 'assignment_slack_samples' not in self.metrics:
+                self.metrics['assignment_slack_samples'] = []
+            self.metrics['assignment_slack_samples'].append(assignment_slack)
+        
+        if not committed:
+            return False
+        
+        # Validate and filter stops
+        committed_set = set(committed)
+        filtered_stops = []
+        for stop in planned_stops:
+            if stop.get('type') == 'D':
+                oid = stop.get('order_id')
+                if oid is not None and oid not in committed_set:
+                    if self.debug_state_warnings:
+                        print(f"[Warning] Drone {drone_id} append skipping D stop for uncommitted order {oid}")
+                    continue
+            filtered_stops.append(stop)
+        
+        if not filtered_stops:
+            if self.debug_state_warnings:
+                print(f"[Warning] Drone {drone_id} append route empty after filtering - no valid stops")
+            return False
+        
+        # 2) Append stops to existing route (don't replace!)
+        # Initialize planned_stops if it doesn't exist
+        if 'planned_stops' not in drone or drone['planned_stops'] is None:
+            drone['planned_stops'] = deque()
+        
+        # Append new stops to the end of existing route
+        for stop in filtered_stops:
+            drone['planned_stops'].append(stop)
+        
+        # Initialize cargo if needed (don't reset!)
+        if 'cargo' not in drone or drone['cargo'] is None:
+            drone['cargo'] = set()
+        
+        # Mark route as committed
+        drone['route_committed'] = True
+        
+        # 3) Start execution only if drone has no current route
+        # If drone already has planned_stops and is executing, don't interrupt
+        # Only set next target if drone is idle or has no current target
+        if drone['status'] == DroneStatus.IDLE or len(drone['planned_stops']) == len(filtered_stops):
+            # Drone was idle or we just added the first stops
+            self._set_next_target_from_plan(drone_id, drone)
+        
+        return True
+
     def _process_batch_assignment(self, drone_id, order_ids):
         """环境内部执行批量订单分配：给 MPSO 调用"""
         if not order_ids:
@@ -3404,6 +3518,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'speed': drone['speed'],
                 'battery_consumption_rate': drone['battery_consumption_rate'],
                 'has_route': drone.get('route_committed', False),
+                'can_accept_more': drone['current_load'] < drone['max_capacity'],
             }
             drones_snapshot.append(snapshot)
 
